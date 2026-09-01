@@ -1,0 +1,49 @@
+[package]
+name = "pinyinwl"
+version = "0.1.0"
+edition = "2021"
+description = "Pinyin input method for Wayland using libchinese/libpinyin"
+
+[[bin]]
+name = "pinyinwl"
+path = "src/main.rs"
+
+[[bin]]
+name = "cosmic-applet-pinyin"
+path = "src/applet.rs"
+
+[dependencies]
+libcosmic = { path = "../libcosmic", features = ["wayland", "wayland_input_method", "winit", "applet"] }
+cosmic-comp-config = { path = "../cosmic-comp/cosmic-comp-config" }
+libpinyin = { path = "../libchinese/libpinyin" }
+libchinese-core = { path = "../libchinese/core" }
+env_logger = "0.10"
+log = "0.4"
+zbus = "5"
+tokio = { version = "1", features = ["sync"] }
+serde = { version = "1", features = ["derive"] }
+ron = "0.8"
+libc = "0.2"
+
+[profile.release]
+lto = true
+strip = true
+opt-level = "s"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[patch.crates-io]
+wayland-client = { path = "../wayland-rs/wayland-client" }
+wayland-server = { path = "../wayland-rs/wayland-server" }
+wayland-backend = { path = "../wayland-rs/wayland-backend" }
+wayland-scanner = { path = "../wayland-rs/wayland-scanner" }
+wayland-protocols = { path = "../wayland-rs/wayland-protocols" }
+wayland-protocols-wlr = { path = "../wayland-rs/wayland-protocols-wlr" }
+wayland-protocols-misc = { path = "../wayland-rs/wayland-protocols-misc" }
+wayland-protocols-experimental = { path = "../wayland-rs/wayland-protocols-experimental" }
+smithay-client-toolkit = { path = "../client-toolkit" }
+wayland-sys = { path = "../wayland-rs/wayland-sys" }
+
+[patch."https://github.com/pop-os/libcosmic"]
+cosmic-config = { path = "../libcosmic/cosmic-config" }
