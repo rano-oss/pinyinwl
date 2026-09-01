@@ -1,13 +1,11 @@
+mod dbus;
 mod settings;
+mod state;
+mod view;
 
-use std::collections::HashSet;
-
-use libchinese_core::{ImeEngine, KeyEvent as ImeKeyEvent, KeyResult};
-use libpinyin::{parser::Parser, Engine};
-use settings::CharacterSet;
+use libchinese_core::{KeyEvent as ImeKeyEvent, KeyResult};
 
 use cosmic::app::Core;
-use cosmic::cosmic_config::{self, ConfigSet};
 use cosmic::iced::core::event::wayland::input_method::{
     InputMethodEvent, InputMethodKeyboardEvent, KeyEvent, Modifiers,
 };
@@ -19,26 +17,19 @@ use cosmic::iced::platform_specific::shell::wayland::commands::input_method::{
     self, PopupPositionMode,
 };
 use cosmic::iced::{self, window, Subscription, Task};
-use cosmic::iced::{Color, Event};
-use cosmic::widget::{self, container, row, text};
-use cosmic::Element;
-
-use tokio::sync::mpsc;
+use cosmic::iced::{Color, Event, Size};
+use cosmic::widget;
+use state::{AnchorPhase, InputMethodState};
 
 type CosmicAction = cosmic::Action<Message>;
 
-/// Wrap a Task<Message> into Task<CosmicAction>
 fn wrap(task: Task<Message>) -> Task<CosmicAction> {
     task.map(cosmic::action::app)
 }
 
-/// Default data directory for libpinyin model files
-const DATA_DIR: &str = "/usr/share/libpinyin/data";
-
 fn main() -> iced::Result {
     env_logger::init();
 
-    // Check for --settings flag
     if std::env::args().any(|arg| arg == "--settings") {
         return settings::run_settings();
     }
@@ -51,184 +42,34 @@ fn main() -> iced::Result {
     )
 }
 
-fn resolve_data_dir(character_set: CharacterSet) -> String {
-    std::env::var("PINYINWL_DATA_DIR").unwrap_or_else(|_| {
-        let suffix = match character_set {
-            CharacterSet::Simplified => "simplified",
-            CharacterSet::Traditional => "traditional",
-        };
-        let candidates = [
-            format!("{}/{}", DATA_DIR, suffix),
-            DATA_DIR.to_string(),
-            format!(
-                "{}/.local/share/libpinyin/data/{}",
-                std::env::var("HOME").unwrap_or_default(),
-                suffix
-            ),
-            format!("../libchinese/data/converted/{}", suffix),
-        ];
-        for path in &candidates {
-            if std::path::Path::new(path).join("lexicon.fst").exists() {
-                return path.clone();
-            }
-        }
-        DATA_DIR.to_string()
-    })
-}
-
-/// Build fuzzy rules Vec from the settings PinyinConfig.
-fn build_fuzzy_rules(config: &settings::PinyinConfig) -> Vec<String> {
-    if !config.fuzzy_pinyin {
-        return Vec::new();
-    }
-    let mut rules = Vec::new();
-    let pairs: &[(&str, &str, bool)] = &[
-        ("zh", "z", config.fuzzy_zh_z),
-        ("ch", "c", config.fuzzy_ch_c),
-        ("sh", "s", config.fuzzy_sh_s),
-        ("l", "n", config.fuzzy_l_n),
-        ("l", "r", config.fuzzy_l_r),
-        ("f", "h", config.fuzzy_f_h),
-        ("g", "k", config.fuzzy_g_k),
-        ("an", "ang", config.fuzzy_an_ang),
-        ("en", "eng", config.fuzzy_en_eng),
-        ("in", "ing", config.fuzzy_in_ing),
-        ("ian", "iang", config.fuzzy_ian_iang),
-        ("uan", "uang", config.fuzzy_uan_uang),
-    ];
-    for &(a, b, enabled) in pairs {
-        if enabled {
-            rules.push(format!("{}={}", a, b));
-            rules.push(format!("{}={}", b, a));
-        }
-    }
-    rules
-}
-
-/// Whether a composition segment is active (popup anchored at preedit start).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum AnchorPhase {
-    /// Preedit empty — popup follows the text cursor.
-    #[default]
-    Idle,
-    Composing,
-}
-
 struct PinyinWl {
     core: Core,
-    /// The pinyin engine (for candidate generation and user dictionary learning)
-    engine: Engine,
-    /// The IME engine (session + key processing)
-    ime: ImeEngine<Parser>,
-    /// Current pinyin config (for detecting changes on reload)
-    pinyin_config: settings::PinyinConfig,
-    /// Shift key tracking for toggle
-    shift_set: bool,
-    /// Whether in passthrough (English) mode
-    passthrough_mode: bool,
-    /// cosmic-config handle for writing IME status text
-    config_handler: Option<cosmic_config::Config>,
-    /// The window ID of the popup surface
-    popup_id: window::Id,
-    anchor_phase: AnchorPhase,
-    /// Track raw_codes of key presses that were consumed (filtered),
-    /// so we can pair the release filter decision correctly.
-    consumed_keys: HashSet<u32>,
-}
-
-impl PinyinWl {
-    /// Reload config from disk and apply any changes to the running engine.
-    fn reload_config(&mut self) {
-        let new_config = settings::PinyinConfig::load();
-        if self.config_hash(&new_config) == self.config_hash(&self.pinyin_config) {
-            return; // No changes
-        }
-        let old = &self.pinyin_config;
-
-        // Character set changed -> swap lexicon
-        if new_config.character_set != old.character_set {
-            let data_dir = resolve_data_dir(new_config.character_set);
-            let fst_path = std::path::Path::new(&data_dir).join("lexicon.fst");
-            let dat_path = std::path::Path::new(&data_dir).join("lexicon.dat");
-            match libchinese_core::Lexicon::load(&fst_path, &dat_path) {
-                Ok(lexicon) => self.engine.swap_lexicon(lexicon),
-                Err(e) => log::error!(
-                    "Failed to load {:?} lexicon: {}",
-                    new_config.character_set,
-                    e
-                ),
-            }
-        }
-
-        // Candidates per page
-        if new_config.candidates_per_page != old.candidates_per_page {
-            self.ime.set_page_size(new_config.candidates_per_page);
-        }
-
-        // Select keys
-        if new_config.select_keys != old.select_keys {
-            self.ime.set_select_keys(&new_config.select_keys);
-        }
-
-        // Emoji
-        if new_config.emoji_candidate != old.emoji_candidate {
-            self.engine.set_emoji_enabled(new_config.emoji_candidate);
-        }
-
-        // Auto-suggestion
-        if new_config.auto_suggestion != old.auto_suggestion {
-            self.engine.config_mut().auto_suggestion = new_config.auto_suggestion;
-        }
-
-        // Fuzzy pinyin rules
-        {
-            let new_fuzzy = build_fuzzy_rules(&new_config);
-            let old_fuzzy = build_fuzzy_rules(old);
-            if new_fuzzy != old_fuzzy {
-                self.engine.config_mut().fuzzy = new_fuzzy;
-            }
-        }
-
-        // Addons: disable removed, enable added
-        for addon in &old.enabled_addons {
-            if !new_config.enabled_addons.contains(addon) {
-                self.engine.set_addon_enabled(addon, false);
-            }
-        }
-        for addon in &new_config.enabled_addons {
-            if !old.enabled_addons.contains(addon) {
-                self.engine.set_addon_enabled(addon, true);
-            }
-        }
-
-        // Fullwidth
-        if new_config.default_fullwidth != old.default_fullwidth {
-            self.ime.set_fullwidth(new_config.default_fullwidth);
-        }
-
-        self.pinyin_config = new_config;
-    }
-
-    fn config_hash(&self, config: &settings::PinyinConfig) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        config.hash(&mut hasher);
-        hasher.finish()
-    }
+    state: InputMethodState,
+    settings_window: Option<window::Id>,
+    settings_config: settings::PinyinConfig,
+    /// Status line for user-dict actions in the in-process settings window.
+    settings_status: Option<String>,
+    phrase_draft: String,
 }
 
 #[derive(Clone, Debug)]
-enum Message {
+pub enum Message {
     Activate,
     Deactivate,
     KeyPressed(KeyEvent, Key, Modifiers, u32),
-    KeyRepeat(KeyEvent, Key, Modifiers, u32),
     KeyReleased(KeyEvent, Key, Modifiers, u32),
     Modifiers(Modifiers),
     Done,
+    /// Mouse click on candidate (1-based selection index on current page).
+    SelectCandidate(u8),
     DbusToggleMode,
     DbusSetPassthrough(bool),
     DbusToggleHalfFullWidth,
+    DbusToggleCharset,
+    DbusOpenSettings,
+    Settings(settings::Msg),
+    SettingsWindowClosed(window::Id),
+    SettingsOpened,
     ConfigChanged,
 }
 
@@ -249,322 +90,159 @@ impl cosmic::Application for PinyinWl {
 
     fn init(core: Core, _flags: ()) -> (Self, Task<CosmicAction>) {
         let pinyin_config = settings::PinyinConfig::load();
-        let data_dir = resolve_data_dir(pinyin_config.character_set);
-        let engine = Engine::from_data_dir(&data_dir).unwrap_or_else(|e| {
-            log::error!("Failed to load pinyin data from {}: {}", data_dir, e);
-            log::error!("Set PINYINWL_DATA_DIR to point to a directory containing lexicon.fst + lexicon.dat + word_bigram.dat + word_bigram_words.fst");
-            std::process::exit(1);
-        });
-        let mut ime = ImeEngine::from_arc_with_page_size(
-            engine.inner_arc(),
-            pinyin_config.candidates_per_page,
-        );
-        if pinyin_config.default_fullwidth {
-            ime.set_fullwidth(true);
-        }
-        if pinyin_config.select_keys != "123456789" {
-            ime.set_select_keys(&pinyin_config.select_keys);
-        }
-        // Enable emoji candidates if configured
-        engine.set_emoji_enabled(pinyin_config.emoji_candidate);
-        // Apply fuzzy rules and auto_suggestion from config
-        {
-            let mut cfg = engine.config_mut();
-            cfg.fuzzy = build_fuzzy_rules(&pinyin_config);
-            cfg.auto_suggestion = pinyin_config.auto_suggestion;
-        }
-        // Enable configured addon dictionaries
-        for addon_name in &pinyin_config.enabled_addons {
-            engine.set_addon_enabled(addon_name, true);
-        }
-        let config_handler = cosmic_config::Config::new("com.system76.CosmicComp", 1)
-            .map_err(|e| log::error!("Failed to create cosmic-config handler: {}", e))
-            .ok();
-        let mut app = PinyinWl {
-            core,
-            engine,
-            ime,
-            pinyin_config,
-            shift_set: false,
-            passthrough_mode: false,
-            config_handler,
-            popup_id: window::Id::NONE,
-            anchor_phase: AnchorPhase::Idle,
-            consumed_keys: HashSet::new(),
-        };
-        app.write_ime_status(app.mode_status_text());
+        let settings_config = pinyin_config.clone();
+        let mut state = InputMethodState::new(pinyin_config);
+        state.publish_mode_status();
+
         let popup_settings = InputMethodPopupSettings::default();
-        app.popup_id = popup_settings.id;
+        state.popup_id = popup_settings.id;
         let task = Task::batch([
             input_method::get_input_method_popup(popup_settings),
             input_method::set_popup_position_mode(PopupPositionMode::FollowCursor),
         ]);
-        (app, wrap(task))
+        (
+            PinyinWl {
+                core,
+                state,
+                settings_window: None,
+                settings_config,
+                settings_status: None,
+                phrase_draft: String::new(),
+            },
+            wrap(task),
+        )
     }
 
-    fn view(&self) -> Element<'_, Message> {
-        // Required by trait but never called in daemon mode
+    fn view(&self) -> cosmic::Element<'_, Message> {
         widget::Space::new().width(0).height(0).into()
     }
 
-    fn view_window(&self, _id: window::Id) -> Element<'_, Message> {
-        if !self.popup_visible() {
-            return container(
-                widget::column![
-                    row![text::body(String::new())],
-                    row([]),
-                    widget::Space::new().width(0).height(0),
-                ]
-                .spacing(0),
+    fn view_window(&self, id: window::Id) -> cosmic::Element<'_, Message> {
+        if self.settings_window == Some(id) {
+            return settings::settings_view(
+                &self.settings_config,
+                self.settings_status.as_deref(),
+                &self.phrase_draft,
             )
-            .padding(0)
-            .width(iced::Length::Fixed(0.0))
-            .height(iced::Length::Fixed(0.0))
-            .into();
+            .map(Message::Settings);
         }
-        let ctx = self.ime.context();
-        let candidates = &ctx.candidates;
-        let candidate_cursor = ctx.candidate_cursor;
-        let cosmic_theme = cosmic::theme::active();
-        let cosmic = cosmic_theme.cosmic();
-        let accent = cosmic.accent_color();
-        let selected_bg = Color::from(accent);
-        let selected_fg = Color::from(cosmic.on_accent_color());
-        let normal_fg = Color::from(cosmic.primary.on);
-        let dim_fg = Color::from(cosmic.primary.component.on_disabled);
-        let spacing = cosmic.spacing;
-        let corner_radius = cosmic.corner_radii.radius_s;
-        let candidates_row: Element<'_, Message> = if candidates.is_empty() {
-            row([]).into()
-        } else {
-            row(candidates
-                .iter()
-                .enumerate()
-                .map(|(index, candidate)| {
-                    let is_selected = index == candidate_cursor;
-                    let num_label = format!("{}", (index + 1) % 10);
-                    let num_color = if is_selected { selected_fg } else { dim_fg };
-                    let text_color = if is_selected { selected_fg } else { normal_fg };
-                    let content = row![
-                        text::body(num_label).class(cosmic::theme::style::Text::Color(num_color)),
-                        text::body(candidate.to_string())
-                            .class(cosmic::theme::style::Text::Color(text_color)),
-                    ]
-                    .align_y(iced::Alignment::Center)
-                    .spacing(spacing.space_xxxs);
-                    let item: Element<'_, Message> = if is_selected {
-                        container(content)
-                            .padding([spacing.space_xxxs, spacing.space_xs])
-                            .class(cosmic::theme::Container::custom(move |_| {
-                                container::Style {
-                                    background: Some(iced::Background::Color(selected_bg)),
-                                    border: iced::Border {
-                                        radius: corner_radius.into(),
-                                        ..Default::default()
-                                    },
-                                    ..Default::default()
-                                }
-                            }))
-                            .into()
-                    } else {
-                        container(content)
-                            .padding([spacing.space_xxxs, spacing.space_xs])
-                            .into()
-                    };
-                    item
-                })
-                .collect::<Vec<_>>())
-            .spacing(spacing.space_xs)
-            .into()
-        };
-        cosmic::widget::autosize::autosize(
-            container(candidates_row)
-                .padding(spacing.space_xs)
-                .width(iced::Length::Shrink)
-                .height(iced::Length::Shrink)
-                .class(cosmic::theme::Container::Dropdown),
-            widget::Id::new("im-popup"),
-        )
-        .into()
+        // While settings is open, keep the IM popup content empty so the shared
+        // app clear color can be opaque (see style()).
+        if self.settings_window.is_some() {
+            return widget::Space::new().width(0).height(0).into();
+        }
+        view::view(&self.state, id)
+    }
+
+    fn on_close_requested(&self, id: window::Id) -> Option<Message> {
+        Some(Message::SettingsWindowClosed(id))
     }
 
     fn update(&mut self, message: Message) -> Task<CosmicAction> {
+        let state = &mut self.state;
         match message {
             Message::Activate => {
-                self.ime.reset();
-                self.anchor_phase = AnchorPhase::Idle;
+                state.ime.reset();
+                state.anchor_phase = AnchorPhase::Idle;
+                state.publish_mode_status();
                 wrap(input_method::set_popup_position_mode(PopupPositionMode::FollowCursor))
             }
-            Message::Deactivate => {
-                self.ime.reset();
-                self.consumed_keys.clear();
-                self.anchor_phase = AnchorPhase::Idle;
-                Task::none()
-            }
-            Message::KeyPressed(key_event, key, _modifiers, serial) => {
-                let raw_code = key_event.raw_code;
-                if !self.preedit().is_empty() || !self.candidates().is_empty() {
-                    let ime_key = match key.as_ref() {
-                        Key::Character(c)
-                            if c.len() == 1
-                                && c.as_bytes()[0] >= b'1'
-                                && c.as_bytes()[0] <= b'9' =>
-                        {
-                            Some(ImeKeyEvent::Number((c.as_bytes()[0] - b'0') as u8))
-                        }
-                        Key::Character(c) if c == " " => Some(ImeKeyEvent::Space),
-                        Key::Named(Named::ArrowDown) => Some(ImeKeyEvent::Down),
-                        Key::Named(Named::ArrowUp) => Some(ImeKeyEvent::Up),
-                        Key::Named(Named::ArrowLeft) => Some(ImeKeyEvent::Left),
-                        Key::Named(Named::ArrowRight) => Some(ImeKeyEvent::Right),
-                        Key::Named(Named::PageDown) => Some(ImeKeyEvent::PageDown),
-                        Key::Named(Named::PageUp) => Some(ImeKeyEvent::PageUp),
-                        Key::Named(Named::Enter) => Some(ImeKeyEvent::Enter),
-                        Key::Named(Named::Escape) => Some(ImeKeyEvent::Escape),
-                        Key::Named(Named::Backspace) => Some(ImeKeyEvent::Backspace),
-                        _ => {
-                            if let Some(ch) = key_event.utf8.as_ref().and_then(|s| s.chars().last())
-                            {
-                                if ch.is_ascii_lowercase() {
-                                    Some(ImeKeyEvent::Char(ch))
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        }
-                    };
-                    if let Some(ime_key) = ime_key {
-                        let result = self.ime.process_key(ime_key);
-                        if result == KeyResult::Handled {
-                            self.consumed_keys.insert(raw_code);
-                            let cmd = self.process_and_sync();
-                            return wrap(Task::batch(vec![            cmd,
-                                input_method::filter_key(serial, true),
-                            ]));
-                        }
-                    }
+            Message::Deactivate => wrap(apply_switch_im_behavior(state)),
+            Message::KeyPressed(key_event, key, modifiers, serial) => {
+                // serial == 0: client-side key repeat (same Message as Press).
+                if serial == 0 {
+                    return handle_key_repeat(state, key, serial);
                 }
-                if self.passthrough_mode {
-                    if key == Key::Named(Named::Shift) {
-                        self.shift_set = true;
-                        self.consumed_keys.insert(raw_code);
-                        return wrap(input_method::filter_key(serial, true));
-                    } else {
-                        self.shift_set = false;
-                        self.consumed_keys.remove(&raw_code);
-                        return wrap(input_method::filter_key(serial, false));
-                    }
-                }
-                if key == Key::Named(Named::Shift) {
-                    self.shift_set = true;
-                    self.consumed_keys.insert(raw_code);
-                    return wrap(input_method::filter_key(serial, true));
-                }
-                if let Some(ch) = key_event.utf8.as_ref().and_then(|s| s.chars().last()) {
-                    self.shift_set = false;
-                    if self.ime.is_fullwidth() && ch.is_ascii() && ch != '\n' && ch != '\r' {
-                        let fullwidth = libchinese_core::utils::to_fullwidth(&ch.to_string());
-                        self.consumed_keys.insert(raw_code);
-                        let cmd = self.send_commit(fullwidth);
-                        return wrap(Task::batch(vec![        cmd,
-                            input_method::filter_key(serial, true),
-                        ]));
-                    }
-                    if ch.is_ascii_lowercase() {
-                        let result = self.ime.process_key(ImeKeyEvent::Char(ch));
-                        if result == KeyResult::Handled {
-                            self.consumed_keys.insert(raw_code);
-                            let cmd = self.process_and_sync();
-                            return wrap(Task::batch(vec![            cmd,
-                                input_method::filter_key(serial, true),
-                            ]));
-                        }
-                    }
-                    self.consumed_keys.remove(&raw_code);
-                    wrap(input_method::filter_key(serial, false))
-                } else {
-                    self.shift_set = false;
-                    self.consumed_keys.remove(&raw_code);
-                    wrap(input_method::filter_key(serial, false))
-                }
-            }
-            Message::KeyRepeat(_key_event, key, _modifiers, serial) => {
-                // Repeats only matter when we have active preedit or candidates
-                let consumed = if !self.preedit().is_empty() || !self.candidates().is_empty() {
-                    let ime_key = match key.as_ref() {
-                        Key::Named(Named::ArrowDown) => Some(ImeKeyEvent::Down),
-                        Key::Named(Named::ArrowUp) => Some(ImeKeyEvent::Up),
-                        Key::Named(Named::ArrowLeft) => Some(ImeKeyEvent::Left),
-                        Key::Named(Named::ArrowRight) => Some(ImeKeyEvent::Right),
-                        Key::Named(Named::PageDown) => Some(ImeKeyEvent::PageDown),
-                        Key::Named(Named::PageUp) => Some(ImeKeyEvent::PageUp),
-                        Key::Named(Named::Backspace) => Some(ImeKeyEvent::Backspace),
-                        _ => None,
-                    };
-                    if let Some(ime_key) = ime_key {
-                        let result = self.ime.process_key(ime_key);
-                        if result == KeyResult::Handled {
-                            let sync = self.process_and_sync();
-                            if serial != 0 {
-                                return wrap(Task::batch(vec![                sync,
-                                    input_method::filter_key(serial, true),
-                                ]));
-                            }
-                            return wrap(sync);
-                        }
-                    }
-                    false
-                } else {
-                    false
-                };
-                if serial != 0 {
-                    wrap(input_method::filter_key(serial, consumed))
-                } else {
-                    Task::none()
-                }
+                handle_key_press(state, key_event, key, modifiers, serial)
             }
             Message::KeyReleased(key_event, key, _modifiers, serial) => {
                 let raw_code = key_event.raw_code;
-                let was_consumed = self.consumed_keys.remove(&raw_code);
+                let was_consumed = state.consumed_keys.remove(&raw_code);
 
-                if key == Key::Named(Named::Shift) && self.shift_set {
-                    self.shift_set = false;
-                    self.passthrough_mode = !self.passthrough_mode;
-                    self.write_ime_status(self.mode_status_text());
-                    wrap(input_method::filter_key(serial, true))
+                if key == Key::Named(Named::Shift) && state.shift_set {
+                    state.shift_set = false;
+                    let english = !state.ime.is_passthrough();
+                    let cmd = state.set_english_mode(english);
+                    wrap(Task::batch(vec![cmd, input_method::filter_key(serial, true)]))
                 } else {
-                    // Match the release filter to the press filter
                     wrap(input_method::filter_key(serial, was_consumed))
                 }
             }
             Message::Modifiers(_modifiers) => Task::none(),
-            Message::Done => wrap(self.handle_done()),
+            Message::Done => wrap(state.handle_done()),
+            Message::SelectCandidate(n) => {
+                if n == 0 || state.candidates().is_empty() {
+                    return Task::none();
+                }
+                if state.ime.process_key(ImeKeyEvent::Number(n)) == KeyResult::Handled {
+                    wrap(state.process_key_and_sync())
+                } else {
+                    Task::none()
+                }
+            }
             Message::DbusToggleMode => {
-                self.passthrough_mode = !self.passthrough_mode;
-                self.write_ime_status(self.mode_status_text());
-                Task::none()
+                let english = !state.ime.is_passthrough();
+                wrap(state.set_english_mode(english))
             }
-            Message::DbusSetPassthrough(passthrough) => {
-                self.passthrough_mode = passthrough;
-                self.write_ime_status(self.mode_status_text());
-                Task::none()
-            }
+            Message::DbusSetPassthrough(passthrough) => wrap(state.set_english_mode(passthrough)),
             Message::DbusToggleHalfFullWidth => {
-                // If preedit is active, commit it first
-                let cmd = if !self.preedit().is_empty() {
-                    self.ime.process_key(ImeKeyEvent::Enter);
-                    wrap(self.process_and_sync())
+                let cmd = if !state.preedit().is_empty() {
+                    state.ime.process_key(ImeKeyEvent::Enter);
+                    wrap(state.process_key_and_sync())
                 } else {
                     Task::none()
                 };
-                self.ime.toggle_fullwidth();
-                self.write_ime_status(self.mode_status_text());
+                state.ime.toggle_fullwidth();
+                state.publish_mode_status();
                 cmd
             }
+            Message::DbusToggleCharset => {
+                state.toggle_character_set();
+                Task::none()
+            }
+            Message::DbusOpenSettings => {
+                if let Some(id) = self.settings_window {
+                    return wrap(window::gain_focus(id));
+                }
+                self.open_settings_window()
+            }
+            Message::Settings(msg) => {
+                match msg {
+                    settings::Msg::CustomPhraseInput(s) => {
+                        self.phrase_draft = s;
+                    }
+                    settings::Msg::AddCustomPhrase => {
+                        let phrase = self.phrase_draft.trim().to_string();
+                        if phrase.is_empty() {
+                            self.settings_status = Some("Enter a phrase to add.".into());
+                        } else {
+                            self.settings_status = Some(settings::add_custom_phrase(&phrase));
+                            self.phrase_draft.clear();
+                        }
+                    }
+                    settings::Msg::DeleteCustomPhrase(p) => {
+                        self.settings_status = Some(settings::delete_custom_phrase(&p));
+                    }
+                    other => {
+                        self.settings_status =
+                            settings::apply_msg(&mut self.settings_config, other);
+                        self.state.apply_live_config(self.settings_config.clone());
+                        self.state.publish_mode_status();
+                    }
+                }
+                Task::none()
+            }
+            Message::SettingsOpened => Task::none(),
+            Message::SettingsWindowClosed(id) => {
+                if self.settings_window == Some(id) {
+                    self.settings_window = None;
+                    self.settings_status = None;
+                }
+                wrap(input_method::reset_popup_size())
+            }
             Message::ConfigChanged => {
-                self.reload_config();
+                self.state.reload_config();
+                self.settings_config = self.state.pinyin_config.clone();
                 Task::none()
             }
         }
@@ -596,7 +274,7 @@ impl cosmic::Application for PinyinWl {
                     Some(Message::KeyReleased(key, key_code, modifiers, serial))
                 }
                 InputMethodKeyboardEvent::Repeat(key, key_code, modifiers, serial) => {
-                    Some(Message::KeyRepeat(key, key_code, modifiers, serial))
+                    Some(Message::KeyPressed(key, key_code, modifiers, serial))
                 }
                 InputMethodKeyboardEvent::Modifiers(modifiers) => {
                     Some(Message::Modifiers(modifiers))
@@ -605,229 +283,431 @@ impl cosmic::Application for PinyinWl {
             _ => None,
         });
 
-        let dbus_sub = Subscription::run(dbus_subscription);
-        let config_sub = Subscription::run(config_watcher_subscription);
-
-        Subscription::batch([wayland_sub, dbus_sub, config_sub])
+        Subscription::batch([
+            wayland_sub,
+            Subscription::run(dbus::dbus_subscription),
+            Subscription::run(config_watcher),
+        ])
     }
 
     fn style(&self) -> Option<cosmic::iced::theme::Style> {
         let cosmic = cosmic::theme::active();
         let cosmic = cosmic.cosmic();
+        // iced has a single clear color for all windows. Keep it transparent
+        // while only the IM popup is alive; switch to opaque while settings is
+        // open (popup content is forced empty in view_window).
+        let background_color = if self.settings_window.is_some() {
+            Color::from(cosmic.bg_color())
+        } else {
+            Color::TRANSPARENT
+        };
         Some(cosmic::iced::theme::Style {
-            background_color: Color::TRANSPARENT,
+            background_color,
             text_color: cosmic.on_bg_color().into(),
             icon_color: cosmic.on_bg_color().into(),
         })
     }
 }
 
-// Helper methods on PinyinWl
 impl PinyinWl {
-    fn write_ime_status(&self, text: &str) {
-        if let Some(ref handler) = self.config_handler {
-            if let Err(e) = handler.set("ime_status_text", &text.to_string()) {
-                log::error!("Failed to write ime_status_text: {}", e);
+    fn open_settings_window(&mut self) -> Task<CosmicAction> {
+        self.settings_config = settings::PinyinConfig::load();
+        self.settings_status = None;
+        let (id, open) = window::open(window::Settings {
+            size: Size::new(600.0, 800.0),
+            exit_on_close_request: true,
+            decorations: true,
+            transparent: false,
+            ..Default::default()
+        });
+        self.settings_window = Some(id);
+        // Collapse IM popup immediately; avoid remount flicker while the
+        // shared clear color switches to opaque for the settings window.
+        wrap(Task::batch([
+            input_method::reset_popup_size(),
+            open.map(|_| Message::SettingsOpened),
+        ]))
+    }
+}
+
+fn handle_key_press(
+    state: &mut InputMethodState,
+    key_event: KeyEvent,
+    key: Key,
+    modifiers: Modifiers,
+    serial: u32,
+) -> Task<CosmicAction> {
+    let raw_code = key_event.raw_code;
+
+    // Ctrl+Shift+F: toggle 简/繁 when idle.
+    if modifiers.ctrl
+        && modifiers.shift
+        && !modifiers.alt
+        && matches!(key.as_ref(), Key::Character(c) if c.eq_ignore_ascii_case("f"))
+        && state.preedit().is_empty()
+        && state.candidates().is_empty()
+    {
+        state.shift_set = false;
+        state.consumed_keys.insert(raw_code);
+        state.toggle_character_set();
+        return wrap(input_method::filter_key(serial, true));
+    }
+
+    // Ctrl+.: toggle punctuation mode (ibus/fcitx).
+    if modifiers.ctrl
+        && !modifiers.shift
+        && !modifiers.alt
+        && matches!(key.as_ref(), Key::Character(c) if c == ".")
+    {
+        state.shift_set = false;
+        state.consumed_keys.insert(raw_code);
+        if state.ime.process_key(ImeKeyEvent::Ctrl('.')) == KeyResult::Handled {
+            return wrap(Task::batch([
+                state.process_key_and_sync(),
+                input_method::filter_key(serial, true),
+            ]));
+        }
+        return wrap(input_method::filter_key(serial, true));
+    }
+
+    // Ctrl+7: forget highlighted candidate (fcitx default).
+    if modifiers.ctrl
+        && !modifiers.shift
+        && !modifiers.alt
+        && !state.candidates().is_empty()
+        && matches!(key.as_ref(), Key::Character(c) if c == "7")
+    {
+        state.shift_set = false;
+        state.consumed_keys.insert(raw_code);
+        if state.ime.process_key(ImeKeyEvent::ForgetWord) == KeyResult::Handled {
+            return wrap(Task::batch([
+                state.process_key_and_sync(),
+                input_method::filter_key(serial, true),
+            ]));
+        }
+        return wrap(input_method::filter_key(serial, true));
+    }
+
+    // Ctrl+8: pin highlighted candidate as custom phrase.
+    if modifiers.ctrl
+        && !modifiers.shift
+        && !modifiers.alt
+        && !state.candidates().is_empty()
+        && matches!(key.as_ref(), Key::Character(c) if c == "8")
+    {
+        state.shift_set = false;
+        state.consumed_keys.insert(raw_code);
+        if state.ime.process_key(ImeKeyEvent::PinPhrase) == KeyResult::Handled {
+            return wrap(Task::batch([
+                state.process_key_and_sync(),
+                input_method::filter_key(serial, true),
+            ]));
+        }
+        return wrap(input_method::filter_key(serial, true));
+    }
+
+    let composing = !state.preedit().is_empty() || !state.candidates().is_empty();
+    if composing {
+        // v-mode: digit keys extend the numeral buffer (v123 → 一二三), not select.
+        let v_digit = state.pinyin_config.v_mode_enabled
+            && state
+                .preedit()
+                .chars()
+                .find(|c| *c != '\'')
+                .is_some_and(|c| c == 'v')
+            && matches!(
+                key.as_ref(),
+                Key::Character(c) if c.len() == 1 && c.as_bytes()[0].is_ascii_digit()
+            );
+
+        let ime_key = if v_digit {
+            match key.as_ref() {
+                Key::Character(c) => c.chars().next().map(ImeKeyEvent::Char),
+                _ => None,
+            }
+        } else {
+            selection_number(state, &key, &key_event, modifiers)
+                .map(ImeKeyEvent::Number)
+                .or_else(|| choose_char_alias(state, &key))
+                .or_else(|| {
+                    (!state.candidates().is_empty())
+                        .then(|| page_alias(&key, &state.pinyin_config))
+                        .flatten()
+                })
+                .or_else(|| {
+                InputMethodState::composing_ime_key(
+                    &key,
+                    false,
+                    state.pinyin_config.select_candidate_with_arrow_key,
+                )
+            })
+                .or_else(|| {
+                    key_event
+                        .utf8
+                        .as_ref()
+                        .and_then(|s| s.chars().last())
+                        .and_then(|ch| {
+                            if ch.is_ascii_lowercase() {
+                                Some(ImeKeyEvent::Char(ch))
+                            } else if state.pinyin_config.chinese_punctuation
+                                && libchinese_core::preferred_chinese_punct(ch).is_some()
+                                && page_alias(&key, &state.pinyin_config).is_none()
+                            {
+                                Some(ImeKeyEvent::Char(ch))
+                            } else {
+                                None
+                            }
+                        })
+                })
+        };
+        if let Some(ime_key) = ime_key {
+            if state.ime.process_key(ime_key) == KeyResult::Handled {
+                state.shift_set = false;
+                state.consumed_keys.insert(raw_code);
+                return wrap(Task::batch([
+                    state.process_key_and_sync(),
+                    input_method::filter_key(serial, true),
+                ]));
             }
         }
     }
 
-    fn mode_status_text(&self) -> &str {
-        if self.passthrough_mode {
-            "英"
-        } else if self.ime.is_fullwidth() {
-            "全"
-        } else {
-            "中"
+    if key == Key::Named(Named::Shift) {
+        state.shift_set = true;
+        state.consumed_keys.insert(raw_code);
+        return wrap(input_method::filter_key(serial, true));
+    }
+
+    // Any other key cancels a pending Shift 中/英 toggle. Otherwise Shift+letter
+    // (capitals in 英 passthrough, or accidental caps while composing) flips mode
+    // when Shift is released.
+    state.shift_set = false;
+
+    // Shift+Space toggles fullwidth (ibus-libpinyin style), including in 英 mode.
+    if matches!(key.as_ref(), Key::Character(c) if c == " ") && modifiers.shift {
+        state.ime.toggle_fullwidth();
+        state.publish_mode_status();
+        state.consumed_keys.insert(raw_code);
+        return wrap(input_method::filter_key(serial, true));
+    }
+
+    if let Some(ch) = key_event.utf8.as_ref().and_then(|s| s.chars().last()) {
+        // Fullwidth must run even in 英 passthrough — otherwise ASCII never converts.
+        if state.ime.is_fullwidth() && ch.is_ascii() && ch != '\n' && ch != '\r' {
+            state.consumed_keys.insert(raw_code);
+            return wrap(Task::batch([
+                state.send_commit(libchinese_core::utils::to_fullwidth(&ch.to_string())),
+                input_method::filter_key(serial, true),
+            ]));
         }
     }
 
-    fn preedit(&self) -> &str {
-        &self.ime.context().preedit_text
+    if state.ime.is_passthrough() {
+        state.consumed_keys.remove(&raw_code);
+        return wrap(input_method::filter_key(serial, false));
     }
 
-    fn candidates(&self) -> &[String] {
-        &self.ime.context().candidates
-    }
-
-    fn cursor_byte_position(&self) -> i32 {
-        self.ime.context().preedit_cursor as i32
-    }
-
-    fn take_commit(&mut self) -> Option<String> {
-        let ctx = self.ime.context_mut();
-        if ctx.has_commit() {
-            Some(ctx.take_commit())
+    if let Some(ch) = key_event.utf8.as_ref().and_then(|s| s.chars().last()) {
+        let as_ime = if ch.is_ascii_lowercase() {
+            Some(ImeKeyEvent::Char(ch))
+        } else if state.pinyin_config.chinese_punctuation
+            && libchinese_core::preferred_chinese_punct(ch).is_some()
+        {
+            Some(ImeKeyEvent::Char(ch))
         } else {
             None
+        };
+        if let Some(ime_key) = as_ime {
+            if state.ime.process_key(ime_key) == KeyResult::Handled {
+                state.consumed_keys.insert(raw_code);
+                return wrap(Task::batch([
+                    state.process_key_and_sync(),
+                    input_method::filter_key(serial, true),
+                ]));
+            }
+        }
+        state.consumed_keys.remove(&raw_code);
+        wrap(input_method::filter_key(serial, false))
+    } else {
+        state.consumed_keys.remove(&raw_code);
+        wrap(input_method::filter_key(serial, false))
+    }
+}
+
+fn page_alias(key: &Key, cfg: &settings::PinyinConfig) -> Option<ImeKeyEvent> {
+    match key.as_ref() {
+        Key::Character(c) if c == "-" && cfg.minus_equal_page => Some(ImeKeyEvent::PageUp),
+        Key::Character(c) if c == "=" && cfg.minus_equal_page => Some(ImeKeyEvent::PageDown),
+        Key::Character(c) if c == "," && cfg.comma_period_page => Some(ImeKeyEvent::PageUp),
+        Key::Character(c) if c == "." && cfg.comma_period_page => Some(ImeKeyEvent::PageDown),
+        Key::Character(c) if c == "[" && cfg.square_bracket_page => Some(ImeKeyEvent::PageUp),
+        Key::Character(c) if c == "]" && cfg.square_bracket_page => Some(ImeKeyEvent::PageDown),
+        _ => None,
+    }
+}
+
+/// 以词定字: `[` → first char, `]` → last char of highlighted multi-char phrase.
+fn choose_char_alias(state: &InputMethodState, key: &Key) -> Option<ImeKeyEvent> {
+    if !state.pinyin_config.choose_char_from_phrase {
+        return None;
+    }
+    let candidates = state.candidates();
+    if candidates.is_empty() {
+        return None;
+    }
+    let cursor = state.candidate_cursor();
+    let selected = candidates.get(cursor).or_else(|| candidates.first())?;
+    if selected.chars().count() < 2 {
+        return None;
+    }
+    match key.as_ref() {
+        Key::Character(c) if c == "[" => Some(ImeKeyEvent::ChooseCharFromPhrase(0)),
+        Key::Character(c) if c == "]" => Some(ImeKeyEvent::ChooseCharFromPhrase(-1)),
+        _ => None,
+    }
+}
+
+fn selection_number(
+    state: &InputMethodState,
+    key: &Key,
+    key_event: &KeyEvent,
+    modifiers: Modifiers,
+) -> Option<u8> {
+    if state.candidates().is_empty() {
+        return None;
+    }
+    let keys = &state.pinyin_config.select_keys;
+    let idx_to_num = |idx: usize| (idx + 1) as u8;
+
+    if state.pinyin_config.use_keypad_as_selection_key {
+        const KP_0: u32 = 0xffb0;
+        if (KP_0..=KP_0 + 9).contains(&key_event.keysym) {
+            let digit = (key_event.keysym - KP_0) as u8;
+            let ch = char::from(b'0' + digit);
+            if let Some(idx) = keys.find(ch) {
+                return Some(idx_to_num(idx));
+            }
         }
     }
 
-    fn send_commit(&self, text: String) -> Task<Message> {
-        Task::batch(vec![
-            input_method::commit_string(text),
-            input_method::commit(),
-        ])
+    if state.pinyin_config.shift_select_candidate && modifiers.shift && !modifiers.ctrl {
+        let idx = match key_event.keysym {
+            k @ 0x0031..=0x0039 => Some((k - 0x0031) as usize),
+            0x0030 => Some(9),
+            _ => None,
+        };
+        if let Some(idx) = idx.filter(|&i| i < keys.chars().count()) {
+            return Some(idx_to_num(idx));
+        }
+        if let Key::Character(c) = key.as_ref() {
+            if let Some(ch) = c.chars().next().map(|c| c.to_ascii_lowercase()) {
+                if let Some(idx) = keys.find(ch) {
+                    return Some(idx_to_num(idx));
+                }
+            }
+        }
     }
+    None
+}
 
-    fn follow_cursor_sync(&mut self) -> Task<Message> {
-        self.anchor_phase = AnchorPhase::Idle;
-        Task::batch([
-            input_method::set_popup_position_mode(PopupPositionMode::FollowCursor),
-            input_method::reset_popup_size(),
-            input_method::set_preedit_string(String::new(), 0, 0),
-            input_method::commit(),
-        ])
-    }
-
-    fn start_preedit_anchor(&mut self, preedit: String) -> Task<Message> {
-        self.anchor_phase = AnchorPhase::Composing;
-        let cursor = self.cursor_byte_position();
-        Task::batch([
-            input_method::set_popup_position_mode(PopupPositionMode::StartOfPreedit),
-            input_method::set_preedit_string(preedit, cursor, cursor),
-            input_method::commit(),
-        ])
-    }
-
-    fn send_preedit_sync(&self, preedit: String) -> Task<Message> {
-        let cursor = self.cursor_byte_position();
-        Task::batch([
-            input_method::set_preedit_string(preedit, cursor, cursor),
-            input_method::commit(),
-        ])
-    }
-
-    fn handle_done(&mut self) -> Task<Message> {
-        Task::none()
-    }
-
-    fn process_and_sync(&mut self) -> Task<Message> {
-        if let Some(text) = self.take_commit() {
-            self.engine.commit(&text);
-            let preedit = self.preedit().to_owned();
-            if preedit.is_empty() {
-                self.anchor_phase = AnchorPhase::Idle;
-                return Task::batch([
+fn apply_switch_im_behavior(state: &mut InputMethodState) -> Task<Message> {
+    state.consumed_keys.clear();
+    match state.pinyin_config.switch_im_behavior.as_str() {
+        "Keep" => {
+            state.anchor_phase = AnchorPhase::Idle;
+            Task::none()
+        }
+        "CommitDefault" if !state.candidates().is_empty() => {
+            let _ = state.ime.process_key(ImeKeyEvent::Number(1));
+            state.process_key_and_sync()
+        }
+        behavior => {
+            let commit = matches!(behavior, "CommitPreedit" | "CommitDefault")
+                .then(|| state.preedit().to_owned())
+                .filter(|t| !t.is_empty());
+            state.ime.reset();
+            state.anchor_phase = AnchorPhase::Idle;
+            match commit {
+                Some(text) => Task::batch([
                     input_method::set_popup_position_mode(PopupPositionMode::FollowCursor),
                     input_method::reset_popup_size(),
-                    input_method::commit_string(text),
+                    state.send_commit(text),
+                ]),
+                None => Task::batch([
+                    input_method::set_popup_position_mode(PopupPositionMode::FollowCursor),
+                    input_method::reset_popup_size(),
+                    input_method::set_preedit_string(String::new(), 0, 0),
                     input_method::commit(),
-                ]);
+                ]),
             }
-            self.anchor_phase = AnchorPhase::Composing;
-            let cursor = self.cursor_byte_position();
-            return Task::batch([
-                input_method::commit_string(text),
-                input_method::set_preedit_string(preedit, cursor, cursor),
-                input_method::commit(),
-            ]);
-        }
-
-        let preedit = self.preedit().to_owned();
-        if preedit.is_empty() {
-            self.follow_cursor_sync()
-        } else if self.anchor_phase == AnchorPhase::Idle {
-            self.start_preedit_anchor(preedit)
-        } else {
-            self.send_preedit_sync(preedit)
         }
     }
+}
 
-    fn popup_visible(&self) -> bool {
-        !self.candidates().is_empty()
+fn handle_key_repeat(
+    state: &mut InputMethodState,
+    key: Key,
+    serial: u32,
+) -> Task<CosmicAction> {
+    if !state.preedit().is_empty() || !state.candidates().is_empty() {
+        if let Some(ime_key) = InputMethodState::composing_ime_key(
+            &key,
+            true,
+            state.pinyin_config.select_candidate_with_arrow_key,
+        )
+            .or_else(|| choose_char_alias(state, &key))
+            .or_else(|| {
+                (!state.candidates().is_empty())
+                    .then(|| page_alias(&key, &state.pinyin_config))
+                    .flatten()
+            })
+        {
+            if state.ime.process_key(ime_key) == KeyResult::Handled {
+                let sync = state.process_key_and_sync();
+                return if serial != 0 {
+                    wrap(Task::batch([sync, input_method::filter_key(serial, true)]))
+                } else {
+                    wrap(sync)
+                };
+            }
+        }
+    }
+    if serial != 0 {
+        wrap(input_method::filter_key(serial, false))
+    } else {
+        Task::none()
     }
 }
 
-/// D-Bus interface for external control of the IME
-struct PinyinWlDbus {
-    tx: mpsc::UnboundedSender<Message>,
-}
-
-#[zbus::interface(name = "com.pinyinwl.InputMethod1")]
-impl PinyinWlDbus {
-    async fn toggle_mode(&self) {
-        let _ = self.tx.send(Message::DbusToggleMode);
-    }
-
-    async fn set_passthrough(&self, passthrough: bool) {
-        let _ = self.tx.send(Message::DbusSetPassthrough(passthrough));
-    }
-
-    async fn toggle_half_full_width(&self) {
-        let _ = self.tx.send(Message::DbusToggleHalfFullWidth);
-    }
-}
-
-/// Subscription that watches pinyin config for changes and emits ConfigChanged.
-fn config_watcher_subscription() -> impl cosmic::iced::futures::Stream<Item = Message> {
+fn config_watcher() -> impl cosmic::iced::futures::Stream<Item = Message> {
     cosmic::iced::stream::channel(1, async |mut sender| {
         use cosmic::iced::futures::SinkExt;
+        use tokio::sync::mpsc;
 
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let _watcher = match cosmic::cosmic_config::Config::new("com.pinyinwl.Settings", 1) {
-            Ok(config) => match config.watch(move |_, _| {
-                let _ = tx.send(()).ok();
-            }) {
-                Ok(w) => w,
+        let _watcher =
+            match cosmic::cosmic_config::Config::new(settings::CONFIG_NAME, settings::CONFIG_VERSION)
+            {
+                Ok(config) => match config.watch(move |_, _| {
+                    let _ = tx.send(()).ok();
+                }) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        log::error!("Failed to watch pinyin config: {}", e);
+                        std::future::pending::<()>().await;
+                        unreachable!()
+                    }
+                },
                 Err(e) => {
-                    log::error!("Failed to watch pinyin config: {}", e);
+                    log::error!("Failed to open pinyin config: {}", e);
                     std::future::pending::<()>().await;
                     unreachable!()
                 }
-            },
-            Err(e) => {
-                log::error!("Failed to open pinyin config: {}", e);
-                std::future::pending::<()>().await;
-                unreachable!()
-            }
-        };
+            };
 
         while rx.recv().await.is_some() {
             let _ = sender.send(Message::ConfigChanged).await;
-        }
-    })
-}
-
-/// Subscription that registers D-Bus service and forwards method calls as Messages
-fn dbus_subscription() -> impl cosmic::iced::futures::Stream<Item = Message> {
-    cosmic::iced::stream::channel(10, async |mut sender| {
-        use cosmic::iced::futures::SinkExt;
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-
-        let dbus_obj = PinyinWlDbus { tx };
-
-        let conn = match zbus::Connection::session().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                log::error!("Failed to connect to D-Bus session bus: {}", e);
-                std::future::pending::<()>().await;
-                unreachable!()
-            }
-        };
-
-        if let Err(e) = conn
-            .object_server()
-            .at("/com/pinyinwl/InputMethod1", dbus_obj)
-            .await
-        {
-            log::error!("Failed to register D-Bus object: {}", e);
-            std::future::pending::<()>().await;
-            unreachable!()
-        }
-
-        if let Err(e) = conn.request_name("com.pinyinwl.InputMethod1").await {
-            log::error!("Failed to request D-Bus name: {}", e);
-            std::future::pending::<()>().await;
-            unreachable!()
-        }
-
-        log::info!("D-Bus service registered: com.pinyinwl.InputMethod1");
-
-        while let Some(msg) = rx.recv().await {
-            let _ = sender.send(msg).await;
         }
     })
 }
