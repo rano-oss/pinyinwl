@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Pinyin IME Indicator
+Comment=Panel indicator for Pinyin input method
+Exec=cosmic-applet-pinyin
+Icon=input-keyboard-symbolic
+Type=Application
+X-CosmicApplet=true
+X-CosmicShrinkable=true
+X-CosmicHoverPopup=Auto
+X-OverflowPriority=10
+X-CosmicInputMethod=pinyinwl
+NoDisplay=true
