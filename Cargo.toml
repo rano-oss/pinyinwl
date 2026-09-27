@@ -24,6 +24,9 @@ tokio = { version = "1", features = ["sync"] }
 serde = { version = "1", features = ["derive"] }
 ron = "0.8"
 libc = "0.2"
+# Pin wayland-client: 0.31.15 breaks sctk 0.20 / iced_winit frame() API
+wayland-client = "=0.31.14"
+wayland-cursor = "=0.31.14"
 
 [profile.release]
 lto = true
@@ -34,16 +37,8 @@ opt-level = "s"
 opt-level = 2
 
 [patch.crates-io]
-wayland-client = { path = "../wayland-rs/wayland-client" }
-wayland-server = { path = "../wayland-rs/wayland-server" }
-wayland-backend = { path = "../wayland-rs/wayland-backend" }
-wayland-scanner = { path = "../wayland-rs/wayland-scanner" }
 wayland-protocols = { path = "../wayland-rs/wayland-protocols" }
-wayland-protocols-wlr = { path = "../wayland-rs/wayland-protocols-wlr" }
-wayland-protocols-misc = { path = "../wayland-rs/wayland-protocols-misc" }
 wayland-protocols-experimental = { path = "../wayland-rs/wayland-protocols-experimental" }
-smithay-client-toolkit = { path = "../client-toolkit" }
-wayland-sys = { path = "../wayland-rs/wayland-sys" }
 
 [patch."https://github.com/pop-os/libcosmic"]
 cosmic-config = { path = "../libcosmic/cosmic-config" }

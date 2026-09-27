@@ -105,12 +105,16 @@ fn build_fuzzy_rules(config: &settings::PinyinConfig) -> Vec<String> {
     rules
 }
 
-/// Whether a composition segment is active (popup anchored at preedit start).
+/// Handshake for StartOfPreedit popup lock (engine preedit is source of truth).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum AnchorPhase {
     /// Preedit empty — popup follows the text cursor.
     #[default]
     Idle,
+    /// Caret-at-0 preedit sent; waiting for Done before real caret.
+    Probing,
+    /// Commit sent; waiting for Done before caret-at-0 re-lock.
+    PartialCommitPending,
     Composing,
 }
 
@@ -664,7 +668,7 @@ impl PinyinWl {
     }
 
     fn send_commit(&self, text: String) -> Task<Message> {
-        Task::batch(vec![
+        Task::batch([
             input_method::commit_string(text),
             input_method::commit(),
         ])
@@ -680,13 +684,19 @@ impl PinyinWl {
         ])
     }
 
+    fn probe_preedit_at_zero(preedit: String) -> Task<Message> {
+        Task::batch([
+            input_method::set_preedit_string(preedit, 0, 0),
+            input_method::commit(),
+        ])
+    }
+
+    /// Arm StartOfPreedit and probe with caret at byte 0.
     fn start_preedit_anchor(&mut self, preedit: String) -> Task<Message> {
-        self.anchor_phase = AnchorPhase::Composing;
-        let cursor = self.cursor_byte_position();
+        self.anchor_phase = AnchorPhase::Probing;
         Task::batch([
             input_method::set_popup_position_mode(PopupPositionMode::StartOfPreedit),
-            input_method::set_preedit_string(preedit, cursor, cursor),
-            input_method::commit(),
+            Self::probe_preedit_at_zero(preedit),
         ])
     }
 
@@ -699,7 +709,18 @@ impl PinyinWl {
     }
 
     fn handle_done(&mut self) -> Task<Message> {
-        Task::none()
+        match self.anchor_phase {
+            AnchorPhase::Probing => {
+                self.anchor_phase = AnchorPhase::Composing;
+                self.send_preedit_sync(self.preedit().to_owned())
+            }
+            AnchorPhase::PartialCommitPending => {
+                // Mode is still StartOfPreedit; caret-at-0 SetPreedit re-arms/seeds.
+                self.anchor_phase = AnchorPhase::Probing;
+                Self::probe_preedit_at_zero(self.preedit().to_owned())
+            }
+            _ => Task::none(),
+        }
     }
 
     fn process_and_sync(&mut self) -> Task<Message> {
@@ -711,17 +732,12 @@ impl PinyinWl {
                 return Task::batch([
                     input_method::set_popup_position_mode(PopupPositionMode::FollowCursor),
                     input_method::reset_popup_size(),
-                    input_method::commit_string(text),
-                    input_method::commit(),
+                    self.send_commit(text),
                 ]);
             }
-            self.anchor_phase = AnchorPhase::Composing;
-            let cursor = self.cursor_byte_position();
-            return Task::batch([
-                input_method::commit_string(text),
-                input_method::set_preedit_string(preedit, cursor, cursor),
-                input_method::commit(),
-            ]);
+            // Commit alone first; on Done, caret-at-0 re-locks then real caret.
+            self.anchor_phase = AnchorPhase::PartialCommitPending;
+            return self.send_commit(text);
         }
 
         let preedit = self.preedit().to_owned();
@@ -729,6 +745,12 @@ impl PinyinWl {
             self.follow_cursor_sync()
         } else if self.anchor_phase == AnchorPhase::Idle {
             self.start_preedit_anchor(preedit)
+        } else if matches!(
+            self.anchor_phase,
+            AnchorPhase::Probing | AnchorPhase::PartialCommitPending
+        ) {
+            // Handshake in progress; Done will sync the current engine preedit.
+            Task::none()
         } else {
             self.send_preedit_sync(preedit)
         }
