@@ -15,7 +15,10 @@ use serde::{Deserialize, Serialize};
 const CONFIG_NAME: &str = "com.pinyinwl.Settings";
 const CONFIG_VERSION: u64 = 1;
 
-const DOUBLE_PINYIN_SCHEMES: &[&str] = &["ZiRanMa", "Microsoft", "XiaoHe", "ZiGuang", "ABC"];
+const SELECT_KEY_OPTIONS: &[&str] = &["123456789", "asdfghjkl", "qwertyuio"];
+const CHARSET_LABELS: &[&str] = &["Simplified", "Traditional"];
+const DOUBLE_PINYIN_LABELS: &[&str] =
+    &["None", "ZiRanMa", "Microsoft", "XiaoHe", "ZiGuang", "ABC"];
 
 /// Available addon dictionary names (shipped with the data package).
 const AVAILABLE_ADDONS: &[&str] = &[
@@ -60,6 +63,8 @@ pub struct PinyinConfig {
     pub sort_by_pinyin_length: bool,
     pub auto_suggestion: bool,
     pub emoji_candidate: bool,
+    /// Show English word candidates while composing (混输).
+    pub english_candidate: bool,
     pub character_set: CharacterSet,
 
     // -- Addon dictionaries --
@@ -108,6 +113,7 @@ impl Default for PinyinConfig {
             sort_by_pinyin_length: false,
             auto_suggestion: true,
             emoji_candidate: true,
+            english_candidate: true,
             character_set: CharacterSet::Simplified,
             enabled_addons: Vec::new(),
 
@@ -185,6 +191,7 @@ pub enum Msg {
     ToggleSortByPinyinLength(bool),
     ToggleAutoSuggestion(bool),
     ToggleEmojiCandidate(bool),
+    ToggleEnglishCandidate(bool),
     SetCharacterSet(CharacterSet),
     // Addons
     ToggleAddon(String, bool),
@@ -220,7 +227,26 @@ pub enum Msg {
     ClearUserDict,
 }
 
-const SELECT_KEY_OPTIONS: &[&str] = &["123456789", "asdfghjkl", "qwertyuio"];
+fn index_of(options: &[&str], current: &str) -> Option<usize> {
+    options.iter().position(|v| *v == current)
+}
+
+fn charset_index(cs: CharacterSet) -> Option<usize> {
+    match cs {
+        CharacterSet::Simplified => Some(0),
+        CharacterSet::Traditional => Some(1),
+    }
+}
+
+fn double_pinyin_index(scheme: &Option<String>) -> Option<usize> {
+    match scheme.as_deref() {
+        None => Some(0),
+        Some(s) => DOUBLE_PINYIN_LABELS
+            .iter()
+            .position(|v| *v == s)
+            .or(Some(0)),
+    }
+}
 
 impl cosmic::Application for SettingsApp {
     type Executor = executor::Default;
@@ -252,151 +278,132 @@ impl cosmic::Application for SettingsApp {
     }
 
     fn update(&mut self, msg: Self::Message) -> Task<Self::Message> {
-        match msg {
-            // General
-            Msg::ToggleDefaultFullwidth(v) => self.config.default_fullwidth = v,
-            Msg::ToggleAutoCommitSingle(v) => self.config.auto_commit_single = v,
-            Msg::SetSelectKeys(k) => self.config.select_keys = k,
-            Msg::SetCandidatesPerPage(n) => self.config.candidates_per_page = n,
-            // Behavior
-            Msg::TogglePinyinIncomplete(v) => self.config.pinyin_incomplete = v,
-            Msg::ToggleSortByPinyinLength(v) => self.config.sort_by_pinyin_length = v,
-            Msg::ToggleAutoSuggestion(v) => self.config.auto_suggestion = v,
-            Msg::ToggleEmojiCandidate(v) => self.config.emoji_candidate = v,
-            Msg::SetCharacterSet(cs) => self.config.character_set = cs,
-            Msg::ToggleAddon(name, enabled) => {
-                if enabled {
-                    if !self.config.enabled_addons.contains(&name) {
-                        self.config.enabled_addons.push(name);
-                    }
-                } else {
-                    self.config.enabled_addons.retain(|n| *n != name);
-                }
-            }
-            // Double pinyin
-            Msg::SetDoublePinyinScheme(s) => self.config.double_pinyin_scheme = s,
-            // Fuzzy
-            Msg::ToggleFuzzyPinyin(v) => self.config.fuzzy_pinyin = v,
-            Msg::ToggleFuzzyZhZ(v) => self.config.fuzzy_zh_z = v,
-            Msg::ToggleFuzzyChC(v) => self.config.fuzzy_ch_c = v,
-            Msg::ToggleFuzzyShS(v) => self.config.fuzzy_sh_s = v,
-            Msg::ToggleFuzzyLN(v) => self.config.fuzzy_l_n = v,
-            Msg::ToggleFuzzyLR(v) => self.config.fuzzy_l_r = v,
-            Msg::ToggleFuzzyFH(v) => self.config.fuzzy_f_h = v,
-            Msg::ToggleFuzzyGK(v) => self.config.fuzzy_g_k = v,
-            Msg::ToggleFuzzyAnAng(v) => self.config.fuzzy_an_ang = v,
-            Msg::ToggleFuzzyEnEng(v) => self.config.fuzzy_en_eng = v,
-            Msg::ToggleFuzzyInIng(v) => self.config.fuzzy_in_ing = v,
-            Msg::ToggleFuzzyIanIang(v) => self.config.fuzzy_ian_iang = v,
-            Msg::ToggleFuzzyUanUang(v) => self.config.fuzzy_uan_uang = v,
-            // Corrections
-            Msg::ToggleCorrectPinyin(v) => self.config.correct_pinyin = v,
-            Msg::ToggleCorrectGnNg(v) => self.config.correct_gn_ng = v,
-            Msg::ToggleCorrectMgNg(v) => self.config.correct_mg_ng = v,
-            Msg::ToggleCorrectIouIu(v) => self.config.correct_iou_iu = v,
-            Msg::ToggleCorrectUeiUi(v) => self.config.correct_uei_ui = v,
-            Msg::ToggleCorrectUenUn(v) => self.config.correct_uen_un = v,
-            Msg::ToggleCorrectUeVe(v) => self.config.correct_ue_ve = v,
-            Msg::ToggleCorrectVU(v) => self.config.correct_v_u = v,
-            Msg::ToggleCorrectOnOng(v) => self.config.correct_on_ong = v,
-            // User dictionary
-            Msg::ExportUserDict => {
-                let status = export_user_dict();
-                self.status_message = Some(status);
-                return Task::none();
-            }
-            Msg::ImportUserDict => {
-                let status = import_user_dict();
-                self.status_message = Some(status);
-                return Task::none();
-            }
-            Msg::ClearUserDict => {
-                let status = clear_user_dict();
-                self.status_message = Some(status);
-                return Task::none();
-            }
+        if let Some(status) = apply_msg(&mut self.config, msg) {
+            self.status_message = Some(status);
         }
-        self.config.save();
         Task::none()
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
-        let dep = (self.config.clone(), self.status_message.clone());
-        widget::lazy(dep, |(config, status_message)| {
-            build_settings_view(config, status_message.as_deref())
-        })
-        .into()
+        settings_view(&self.config, self.status_message.as_deref())
     }
 }
 
+/// Apply a settings message and persist. Returns a status string for user-dict actions.
+pub fn apply_msg(config: &mut PinyinConfig, msg: Msg) -> Option<String> {
+    let mut status = None;
+    match msg {
+        Msg::ToggleDefaultFullwidth(v) => config.default_fullwidth = v,
+        Msg::ToggleAutoCommitSingle(v) => config.auto_commit_single = v,
+        Msg::SetSelectKeys(k) => config.select_keys = k,
+        Msg::SetCandidatesPerPage(n) => config.candidates_per_page = n,
+        Msg::TogglePinyinIncomplete(v) => config.pinyin_incomplete = v,
+        Msg::ToggleSortByPinyinLength(v) => config.sort_by_pinyin_length = v,
+        Msg::ToggleAutoSuggestion(v) => config.auto_suggestion = v,
+        Msg::ToggleEmojiCandidate(v) => config.emoji_candidate = v,
+        Msg::ToggleEnglishCandidate(v) => config.english_candidate = v,
+        Msg::SetCharacterSet(cs) => config.character_set = cs,
+        Msg::ToggleAddon(name, enabled) => {
+            if enabled {
+                if !config.enabled_addons.contains(&name) {
+                    config.enabled_addons.push(name);
+                }
+            } else {
+                config.enabled_addons.retain(|n| *n != name);
+            }
+        }
+        Msg::SetDoublePinyinScheme(s) => config.double_pinyin_scheme = s,
+        Msg::ToggleFuzzyPinyin(v) => config.fuzzy_pinyin = v,
+        Msg::ToggleFuzzyZhZ(v) => config.fuzzy_zh_z = v,
+        Msg::ToggleFuzzyChC(v) => config.fuzzy_ch_c = v,
+        Msg::ToggleFuzzyShS(v) => config.fuzzy_sh_s = v,
+        Msg::ToggleFuzzyLN(v) => config.fuzzy_l_n = v,
+        Msg::ToggleFuzzyLR(v) => config.fuzzy_l_r = v,
+        Msg::ToggleFuzzyFH(v) => config.fuzzy_f_h = v,
+        Msg::ToggleFuzzyGK(v) => config.fuzzy_g_k = v,
+        Msg::ToggleFuzzyAnAng(v) => config.fuzzy_an_ang = v,
+        Msg::ToggleFuzzyEnEng(v) => config.fuzzy_en_eng = v,
+        Msg::ToggleFuzzyInIng(v) => config.fuzzy_in_ing = v,
+        Msg::ToggleFuzzyIanIang(v) => config.fuzzy_ian_iang = v,
+        Msg::ToggleFuzzyUanUang(v) => config.fuzzy_uan_uang = v,
+        Msg::ToggleCorrectPinyin(v) => config.correct_pinyin = v,
+        Msg::ToggleCorrectGnNg(v) => config.correct_gn_ng = v,
+        Msg::ToggleCorrectMgNg(v) => config.correct_mg_ng = v,
+        Msg::ToggleCorrectIouIu(v) => config.correct_iou_iu = v,
+        Msg::ToggleCorrectUeiUi(v) => config.correct_uei_ui = v,
+        Msg::ToggleCorrectUenUn(v) => config.correct_uen_un = v,
+        Msg::ToggleCorrectUeVe(v) => config.correct_ue_ve = v,
+        Msg::ToggleCorrectVU(v) => config.correct_v_u = v,
+        Msg::ToggleCorrectOnOng(v) => config.correct_on_ong = v,
+        Msg::ExportUserDict => status = Some(export_user_dict()),
+        Msg::ImportUserDict => status = Some(import_user_dict()),
+        Msg::ClearUserDict => status = Some(clear_user_dict()),
+    }
+    if status.is_none() {
+        config.save();
+    }
+    status
+}
+
+/// Settings form body (shared by standalone `--settings` and in-IME window).
+pub fn settings_view<'a>(
+    config: &'a PinyinConfig,
+    status_message: Option<&'a str>,
+) -> Element<'a, Msg> {
+    let body = build_settings_view(config, status_message);
+    let bg_color = {
+        let theme = cosmic::theme::active();
+        iced::Color::from(theme.cosmic().bg_color())
+    };
+    // Full-window opaque fill. App clear color must stay transparent (shared with
+    // the IM popup), so settings has to paint every pixel itself.
+    container(body)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .class(cosmic::theme::Container::custom(move |_| {
+            cosmic::widget::container::Style {
+                background: Some(iced::Background::Color(bg_color)),
+                text_color: None,
+                ..Default::default()
+            }
+        }))
+        .into()
+}
+
 /// Build the entire settings view from owned config data.
-/// Used inside `widget::lazy` so the widget tree is cached between frames.
 fn build_settings_view(
     config: &PinyinConfig,
     status_message: Option<&str>,
 ) -> Element<'static, Msg> {
-    // === General section ===
-    let select_keys_buttons = {
-        let buttons: Vec<Element<'static, Msg>> = SELECT_KEY_OPTIONS
-            .iter()
-            .map(|&k| {
-                if k == config.select_keys {
-                    widget::button::suggested(k).into()
-                } else {
-                    widget::button::standard(k)
-                        .on_press(Msg::SetSelectKeys(k.to_string()))
-                        .into()
-                }
-            })
-            .collect();
-        widget::flex_row(buttons).row_spacing(6).column_spacing(6)
-    };
-
-    let candidates_buttons = {
-        let current = config.candidates_per_page;
-        let buttons: Vec<Element<'static, Msg>> = (5..=10)
-            .map(|n| {
-                let label = format!("{}", n);
-                if n == current {
-                    widget::button::suggested(label).into()
-                } else {
-                    widget::button::standard(label)
-                        .on_press(Msg::SetCandidatesPerPage(n))
-                        .into()
-                }
-            })
-            .collect();
-        widget::flex_row(buttons).row_spacing(6).column_spacing(6)
-    };
-
-    let charset_buttons = {
-        let sets: &[(CharacterSet, &str)] = &[
-            (CharacterSet::Simplified, "Simplified"),
-            (CharacterSet::Traditional, "Traditional"),
-        ];
-        let buttons: Vec<Element<'static, Msg>> = sets
-            .iter()
-            .map(|&(cs, label)| {
-                if config.character_set == cs {
-                    widget::button::suggested(label).into()
-                } else {
-                    widget::button::standard(label)
-                        .on_press(Msg::SetCharacterSet(cs))
-                        .into()
-                }
-            })
-            .collect();
-        widget::flex_row(buttons).row_spacing(6).column_spacing(6)
-    };
+    let candidates = config.candidates_per_page.clamp(5, 10);
 
     let general_section: Element<'static, Msg> = settings::section()
         .title("General")
         .add(settings::item(
             "Candidate selection keys",
-            select_keys_buttons,
+            widget::dropdown(
+                SELECT_KEY_OPTIONS,
+                index_of(SELECT_KEY_OPTIONS, &config.select_keys),
+                |i| Msg::SetSelectKeys(SELECT_KEY_OPTIONS[i].to_string()),
+            ),
         ))
-        .add(settings::item("Candidates per page", candidates_buttons))
-        .add(settings::item("Character set", charset_buttons))
+        .add(settings::item(
+            format!("Candidates per page ({candidates})"),
+            widget::slider(5.0..=10.0, candidates as f32, |v| {
+                Msg::SetCandidatesPerPage(v.round() as usize)
+            })
+            .width(Length::Fixed(200.0)),
+        ))
+        .add(settings::item(
+            "Character set",
+            widget::dropdown(CHARSET_LABELS, charset_index(config.character_set), |i| {
+                Msg::SetCharacterSet(if i == 0 {
+                    CharacterSet::Simplified
+                } else {
+                    CharacterSet::Traditional
+                })
+            }),
+        ))
         .add(settings::item(
             "Default fullwidth mode",
             toggler(config.default_fullwidth).on_toggle(Msg::ToggleDefaultFullwidth),
@@ -421,36 +428,28 @@ fn build_settings_view(
             "Emoji candidates",
             toggler(config.emoji_candidate).on_toggle(Msg::ToggleEmojiCandidate),
         ))
+        .add(settings::item(
+            "English candidates",
+            toggler(config.english_candidate).on_toggle(Msg::ToggleEnglishCandidate),
+        ))
         .into();
-
-    // === Double Pinyin section ===
-    let double_pinyin_buttons = {
-        let current = config.double_pinyin_scheme.as_deref();
-        let mut buttons: Vec<Element<'static, Msg>> = Vec::new();
-        let none_btn: Element<'static, Msg> = if current.is_none() {
-            widget::button::suggested("None").into()
-        } else {
-            widget::button::standard("None")
-                .on_press(Msg::SetDoublePinyinScheme(None))
-                .into()
-        };
-        buttons.push(none_btn);
-        for &scheme in DOUBLE_PINYIN_SCHEMES {
-            let btn: Element<'static, Msg> = if current == Some(scheme) {
-                widget::button::suggested(scheme).into()
-            } else {
-                widget::button::standard(scheme)
-                    .on_press(Msg::SetDoublePinyinScheme(Some(scheme.to_string())))
-                    .into()
-            };
-            buttons.push(btn);
-        }
-        widget::flex_row(buttons).row_spacing(6).column_spacing(6)
-    };
 
     let double_pinyin_section: Element<'static, Msg> = settings::section()
         .title("Double Pinyin")
-        .add(settings::item("Scheme", double_pinyin_buttons))
+        .add(settings::item(
+            "Scheme",
+            widget::dropdown(
+                DOUBLE_PINYIN_LABELS,
+                double_pinyin_index(&config.double_pinyin_scheme),
+                |i| {
+                    if i == 0 {
+                        Msg::SetDoublePinyinScheme(None)
+                    } else {
+                        Msg::SetDoublePinyinScheme(Some(DOUBLE_PINYIN_LABELS[i].to_string()))
+                    }
+                },
+            ),
+        ))
         .into();
 
     // === Fuzzy Pinyin section ===

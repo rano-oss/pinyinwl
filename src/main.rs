@@ -1,3 +1,4 @@
+mod dbus;
 mod settings;
 
 use std::collections::HashSet;
@@ -7,7 +8,6 @@ use libpinyin::{parser::Parser, Engine};
 use settings::CharacterSet;
 
 use cosmic::app::Core;
-use cosmic::cosmic_config::{self, ConfigSet};
 use cosmic::iced::core::event::wayland::input_method::{
     InputMethodEvent, InputMethodKeyboardEvent, KeyEvent, Modifiers,
 };
@@ -19,7 +19,7 @@ use cosmic::iced::platform_specific::shell::wayland::commands::input_method::{
     self, PopupPositionMode,
 };
 use cosmic::iced::{self, window, Subscription, Task};
-use cosmic::iced::{Color, Event};
+use cosmic::iced::{Color, Event, Size};
 use cosmic::widget::{self, container, row, text};
 use cosmic::Element;
 
@@ -76,30 +76,59 @@ fn resolve_data_dir(character_set: CharacterSet) -> String {
     })
 }
 
-/// Build fuzzy rules Vec from the settings PinyinConfig.
+/// Build fuzzy + optional correction rules from the settings PinyinConfig.
 fn build_fuzzy_rules(config: &settings::PinyinConfig) -> Vec<String> {
-    if !config.fuzzy_pinyin {
-        return Vec::new();
-    }
     let mut rules = Vec::new();
-    let pairs: &[(&str, &str, bool)] = &[
-        ("zh", "z", config.fuzzy_zh_z),
-        ("ch", "c", config.fuzzy_ch_c),
-        ("sh", "s", config.fuzzy_sh_s),
-        ("l", "n", config.fuzzy_l_n),
-        ("l", "r", config.fuzzy_l_r),
-        ("f", "h", config.fuzzy_f_h),
-        ("g", "k", config.fuzzy_g_k),
-        ("an", "ang", config.fuzzy_an_ang),
-        ("en", "eng", config.fuzzy_en_eng),
-        ("in", "ing", config.fuzzy_in_ing),
-        ("ian", "iang", config.fuzzy_ian_iang),
-        ("uan", "uang", config.fuzzy_uan_uang),
-    ];
-    for &(a, b, enabled) in pairs {
-        if enabled {
-            rules.push(format!("{}={}", a, b));
-            rules.push(format!("{}={}", b, a));
+    if config.fuzzy_pinyin {
+        let pairs: &[(&str, &str, bool)] = &[
+            ("zh", "z", config.fuzzy_zh_z),
+            ("ch", "c", config.fuzzy_ch_c),
+            ("sh", "s", config.fuzzy_sh_s),
+            ("l", "n", config.fuzzy_l_n),
+            ("l", "r", config.fuzzy_l_r),
+            ("f", "h", config.fuzzy_f_h),
+            ("g", "k", config.fuzzy_g_k),
+            ("an", "ang", config.fuzzy_an_ang),
+            ("en", "eng", config.fuzzy_en_eng),
+            ("in", "ing", config.fuzzy_in_ing),
+            ("ian", "iang", config.fuzzy_ian_iang),
+            ("uan", "uang", config.fuzzy_uan_uang),
+        ];
+        for &(a, b, enabled) in pairs {
+            if enabled {
+                rules.push(format!("{}={}", a, b));
+                rules.push(format!("{}={}", b, a));
+            }
+        }
+    }
+    if config.correct_pinyin {
+        let corrections: &[(&str, &str, bool)] = &[
+            ("ng", "gn", config.correct_gn_ng),
+            ("ng", "mg", config.correct_mg_ng),
+            ("iu", "iou", config.correct_iou_iu),
+            ("ui", "uei", config.correct_uei_ui),
+            ("un", "uen", config.correct_uen_un),
+            ("ue", "ve", config.correct_ue_ve),
+            ("ong", "on", config.correct_on_ong),
+        ];
+        for &(a, b, enabled) in corrections {
+            if enabled {
+                rules.push(format!("{}={}:1.5", a, b));
+                rules.push(format!("{}={}:1.5", b, a));
+            }
+        }
+        if config.correct_v_u {
+            for &(a, b) in &[
+                ("ju", "jv"),
+                ("qu", "qv"),
+                ("xu", "xv"),
+                ("yu", "yv"),
+                ("nue", "nve"),
+                ("lue", "lve"),
+            ] {
+                rules.push(format!("{}={}:2.0", a, b));
+                rules.push(format!("{}={}:2.0", b, a));
+            }
         }
     }
     rules
@@ -126,14 +155,16 @@ struct PinyinWl {
     ime: ImeEngine<Parser>,
     /// Current pinyin config (for detecting changes on reload)
     pinyin_config: settings::PinyinConfig,
-    /// Shift key tracking for toggle
+    /// Shift key tracking for 中/英 toggle (modifier-only press)
     shift_set: bool,
-    /// Whether in passthrough (English) mode
-    passthrough_mode: bool,
-    /// cosmic-config handle for writing IME status text
-    config_handler: Option<cosmic_config::Config>,
     /// The window ID of the popup surface
     popup_id: window::Id,
+    /// In-process settings window (D-Bus OpenSettings); None when closed.
+    settings_window: Option<window::Id>,
+    /// Settings form state while the in-process window is open (also mirrors disk).
+    settings_config: settings::PinyinConfig,
+    /// Status line for user-dict actions in the in-process settings window.
+    settings_status: Option<String>,
     anchor_phase: AnchorPhase,
     /// Track raw_codes of key presses that were consumed (filtered),
     /// so we can pair the release filter decision correctly.
@@ -145,72 +176,9 @@ impl PinyinWl {
     fn reload_config(&mut self) {
         let new_config = settings::PinyinConfig::load();
         if self.config_hash(&new_config) == self.config_hash(&self.pinyin_config) {
-            return; // No changes
+            return;
         }
-        let old = &self.pinyin_config;
-
-        // Character set changed -> swap lexicon
-        if new_config.character_set != old.character_set {
-            let data_dir = resolve_data_dir(new_config.character_set);
-            let fst_path = std::path::Path::new(&data_dir).join("lexicon.fst");
-            let dat_path = std::path::Path::new(&data_dir).join("lexicon.dat");
-            match libchinese_core::Lexicon::load(&fst_path, &dat_path) {
-                Ok(lexicon) => self.engine.swap_lexicon(lexicon),
-                Err(e) => log::error!(
-                    "Failed to load {:?} lexicon: {}",
-                    new_config.character_set,
-                    e
-                ),
-            }
-        }
-
-        // Candidates per page
-        if new_config.candidates_per_page != old.candidates_per_page {
-            self.ime.set_page_size(new_config.candidates_per_page);
-        }
-
-        // Select keys
-        if new_config.select_keys != old.select_keys {
-            self.ime.set_select_keys(&new_config.select_keys);
-        }
-
-        // Emoji
-        if new_config.emoji_candidate != old.emoji_candidate {
-            self.engine.set_emoji_enabled(new_config.emoji_candidate);
-        }
-
-        // Auto-suggestion
-        if new_config.auto_suggestion != old.auto_suggestion {
-            self.engine.config_mut().auto_suggestion = new_config.auto_suggestion;
-        }
-
-        // Fuzzy pinyin rules
-        {
-            let new_fuzzy = build_fuzzy_rules(&new_config);
-            let old_fuzzy = build_fuzzy_rules(old);
-            if new_fuzzy != old_fuzzy {
-                self.engine.config_mut().fuzzy = new_fuzzy;
-            }
-        }
-
-        // Addons: disable removed, enable added
-        for addon in &old.enabled_addons {
-            if !new_config.enabled_addons.contains(addon) {
-                self.engine.set_addon_enabled(addon, false);
-            }
-        }
-        for addon in &new_config.enabled_addons {
-            if !old.enabled_addons.contains(addon) {
-                self.engine.set_addon_enabled(addon, true);
-            }
-        }
-
-        // Fullwidth
-        if new_config.default_fullwidth != old.default_fullwidth {
-            self.ime.set_fullwidth(new_config.default_fullwidth);
-        }
-
-        self.pinyin_config = new_config;
+        self.apply_config_diff(new_config);
     }
 
     fn config_hash(&self, config: &settings::PinyinConfig) -> u64 {
@@ -222,7 +190,7 @@ impl PinyinWl {
 }
 
 #[derive(Clone, Debug)]
-enum Message {
+pub enum Message {
     Activate,
     Deactivate,
     KeyPressed(KeyEvent, Key, Modifiers, u32),
@@ -233,6 +201,10 @@ enum Message {
     DbusToggleMode,
     DbusSetPassthrough(bool),
     DbusToggleHalfFullWidth,
+    DbusOpenSettings,
+    Settings(settings::Msg),
+    SettingsWindowClosed(window::Id),
+    SettingsOpened,
     ConfigChanged,
 }
 
@@ -271,32 +243,40 @@ impl cosmic::Application for PinyinWl {
         }
         // Enable emoji candidates if configured
         engine.set_emoji_enabled(pinyin_config.emoji_candidate);
-        // Apply fuzzy rules and auto_suggestion from config
+        engine.set_english_enabled(pinyin_config.english_candidate);
+        engine.set_sort_by_pinyin_length(pinyin_config.sort_by_pinyin_length);
+        engine.set_double_pinyin_scheme(pinyin_config.double_pinyin_scheme.clone());
+        // Apply fuzzy+correction rules, auto_suggestion, incomplete, select_keys
         {
             let mut cfg = engine.config_mut();
             cfg.fuzzy = build_fuzzy_rules(&pinyin_config);
             cfg.auto_suggestion = pinyin_config.auto_suggestion;
+            cfg.select_keys = pinyin_config.select_keys.clone();
+            cfg.incomplete_penalty = if pinyin_config.pinyin_incomplete {
+                500
+            } else {
+                i32::MAX / 4
+            };
         }
         // Enable configured addon dictionaries
         for addon_name in &pinyin_config.enabled_addons {
             engine.set_addon_enabled(addon_name, true);
         }
-        let config_handler = cosmic_config::Config::new("com.system76.CosmicComp", 1)
-            .map_err(|e| log::error!("Failed to create cosmic-config handler: {}", e))
-            .ok();
+        let settings_config = pinyin_config.clone();
         let mut app = PinyinWl {
             core,
             engine,
             ime,
             pinyin_config,
             shift_set: false,
-            passthrough_mode: false,
-            config_handler,
             popup_id: window::Id::NONE,
+            settings_window: None,
+            settings_config,
+            settings_status: None,
             anchor_phase: AnchorPhase::Idle,
             consumed_keys: HashSet::new(),
         };
-        app.write_ime_status(app.mode_status_text());
+        app.publish_mode_status();
         let popup_settings = InputMethodPopupSettings::default();
         app.popup_id = popup_settings.id;
         let task = Task::batch([
@@ -311,7 +291,11 @@ impl cosmic::Application for PinyinWl {
         widget::Space::new().width(0).height(0).into()
     }
 
-    fn view_window(&self, _id: window::Id) -> Element<'_, Message> {
+    fn view_window(&self, id: window::Id) -> Element<'_, Message> {
+        if self.settings_window == Some(id) {
+            return settings::settings_view(&self.settings_config, self.settings_status.as_deref())
+                .map(Message::Settings);
+        }
         if !self.popup_visible() {
             return container(
                 widget::column![
@@ -334,8 +318,8 @@ impl cosmic::Application for PinyinWl {
         let accent = cosmic.accent_color();
         let selected_bg = Color::from(accent);
         let selected_fg = Color::from(cosmic.on_accent_color());
-        let normal_fg = Color::from(cosmic.primary.on);
-        let dim_fg = Color::from(cosmic.primary.component.on_disabled);
+        let normal_fg = Color::from(cosmic.primary(false).on);
+        let dim_fg = Color::from(cosmic.primary(false).component.on_disabled);
         let spacing = cosmic.spacing;
         let corner_radius = cosmic.corner_radii.radius_s;
         let candidates_row: Element<'_, Message> = if candidates.is_empty() {
@@ -392,11 +376,16 @@ impl cosmic::Application for PinyinWl {
         .into()
     }
 
+    fn on_close_requested(&self, id: window::Id) -> Option<Message> {
+        Some(Message::SettingsWindowClosed(id))
+    }
+
     fn update(&mut self, message: Message) -> Task<CosmicAction> {
         match message {
             Message::Activate => {
                 self.ime.reset();
                 self.anchor_phase = AnchorPhase::Idle;
+                self.publish_mode_status();
                 wrap(input_method::set_popup_position_mode(PopupPositionMode::FollowCursor))
             }
             Message::Deactivate => {
@@ -450,7 +439,7 @@ impl cosmic::Application for PinyinWl {
                         }
                     }
                 }
-                if self.passthrough_mode {
+                if self.ime.is_passthrough() {
                     if key == Key::Named(Named::Shift) {
                         self.shift_set = true;
                         self.consumed_keys.insert(raw_code);
@@ -535,9 +524,9 @@ impl cosmic::Application for PinyinWl {
 
                 if key == Key::Named(Named::Shift) && self.shift_set {
                     self.shift_set = false;
-                    self.passthrough_mode = !self.passthrough_mode;
-                    self.write_ime_status(self.mode_status_text());
-                    wrap(input_method::filter_key(serial, true))
+                    let english = !self.ime.is_passthrough();
+                    let cmd = self.set_english_mode(english);
+                    wrap(Task::batch(vec![cmd, input_method::filter_key(serial, true)]))
                 } else {
                     // Match the release filter to the press filter
                     wrap(input_method::filter_key(serial, was_consumed))
@@ -546,14 +535,11 @@ impl cosmic::Application for PinyinWl {
             Message::Modifiers(_modifiers) => Task::none(),
             Message::Done => wrap(self.handle_done()),
             Message::DbusToggleMode => {
-                self.passthrough_mode = !self.passthrough_mode;
-                self.write_ime_status(self.mode_status_text());
-                Task::none()
+                let english = !self.ime.is_passthrough();
+                wrap(self.set_english_mode(english))
             }
             Message::DbusSetPassthrough(passthrough) => {
-                self.passthrough_mode = passthrough;
-                self.write_ime_status(self.mode_status_text());
-                Task::none()
+                wrap(self.set_english_mode(passthrough))
             }
             Message::DbusToggleHalfFullWidth => {
                 // If preedit is active, commit it first
@@ -564,8 +550,40 @@ impl cosmic::Application for PinyinWl {
                     Task::none()
                 };
                 self.ime.toggle_fullwidth();
-                self.write_ime_status(self.mode_status_text());
+                self.publish_mode_status();
                 cmd
+            }
+            Message::DbusOpenSettings => {
+                if let Some(id) = self.settings_window {
+                    return wrap(window::gain_focus(id));
+                }
+                self.settings_config = settings::PinyinConfig::load();
+                self.settings_status = None;
+                let (id, open) = window::open(window::Settings {
+                    size: Size::new(560.0, 640.0),
+                    min_size: Some(Size::new(420.0, 400.0)),
+                    exit_on_close_request: true,
+                    decorations: true,
+                    transparent: false,
+                    resizable: true,
+                    ..Default::default()
+                });
+                self.settings_window = Some(id);
+                wrap(open.map(|_| Message::SettingsOpened))
+            }
+            Message::Settings(msg) => {
+                self.settings_status = settings::apply_msg(&mut self.settings_config, msg);
+                self.apply_live_config(self.settings_config.clone());
+                self.publish_mode_status();
+                Task::none()
+            }
+            Message::SettingsOpened => Task::none(),
+            Message::SettingsWindowClosed(id) => {
+                if self.settings_window == Some(id) {
+                    self.settings_window = None;
+                    self.settings_status = None;
+                }
+                wrap(input_method::reset_popup_size())
             }
             Message::ConfigChanged => {
                 self.reload_config();
@@ -609,13 +627,16 @@ impl cosmic::Application for PinyinWl {
             _ => None,
         });
 
-        let dbus_sub = Subscription::run(dbus_subscription);
+        let dbus_sub = Subscription::run(dbus::dbus_subscription);
         let config_sub = Subscription::run(config_watcher_subscription);
 
         Subscription::batch([wayland_sub, dbus_sub, config_sub])
     }
 
     fn style(&self) -> Option<cosmic::iced::theme::Style> {
+        // Must stay transparent for every window: iced has a single clear color,
+        // and an opaque clear paints the IM popup surface as a solid box that
+        // follows the cursor. Settings paints its own opaque fill in-view.
         let cosmic = cosmic::theme::active();
         let cosmic = cosmic.cosmic();
         Some(cosmic::iced::theme::Style {
@@ -628,22 +649,148 @@ impl cosmic::Application for PinyinWl {
 
 // Helper methods on PinyinWl
 impl PinyinWl {
-    fn write_ime_status(&self, text: &str) {
-        if let Some(ref handler) = self.config_handler {
-            if let Err(e) = handler.set("ime_status_text", &text.to_string()) {
-                log::error!("Failed to write ime_status_text: {}", e);
-            }
-        }
+    fn publish_mode_status(&self) {
+        dbus::publish_mode_label(self.mode_status_text());
     }
 
     fn mode_status_text(&self) -> &str {
-        if self.passthrough_mode {
+        if self.ime.is_passthrough() {
             "英"
         } else if self.ime.is_fullwidth() {
             "全"
         } else {
             "中"
         }
+    }
+
+    /// Switch 中/英 (ibus-libpinyin-style).
+    ///
+    /// Entering 英 with an active preedit commits the raw buffer text, then
+    /// passthrough so subsequent keys go to the client. Leaving 英 clears
+    /// passthrough so lowercase again forms pinyin.
+    fn set_english_mode(&mut self, english: bool) -> Task<Message> {
+        if english == self.ime.is_passthrough() {
+            self.publish_mode_status();
+            return Task::none();
+        }
+
+        let commit = if english && !self.preedit().is_empty() {
+            // Match ibus-libpinyin: commit raw composition text, then reset.
+            let text = self.preedit().to_owned();
+            self.anchor_phase = AnchorPhase::Idle;
+            Some(Task::batch([
+                input_method::set_popup_position_mode(PopupPositionMode::FollowCursor),
+                input_method::reset_popup_size(),
+                self.send_commit(text),
+            ]))
+        } else if english {
+            self.anchor_phase = AnchorPhase::Idle;
+            Some(Task::batch([
+                input_method::set_popup_position_mode(PopupPositionMode::FollowCursor),
+                input_method::reset_popup_size(),
+                input_method::set_preedit_string(String::new(), 0, 0),
+                input_method::commit(),
+            ]))
+        } else {
+            None
+        };
+
+        self.ime.set_passthrough(english);
+        self.publish_mode_status();
+
+        commit.unwrap_or_else(Task::none)
+    }
+
+    /// Apply a full config snapshot to the running engine (in-process settings path).
+    fn apply_live_config(&mut self, new_config: settings::PinyinConfig) {
+        if self.config_hash(&new_config) == self.config_hash(&self.pinyin_config) {
+            self.pinyin_config = new_config;
+            return;
+        }
+        self.apply_config_diff(new_config);
+    }
+
+    fn apply_config_diff(&mut self, new_config: settings::PinyinConfig) {
+        let old = self.pinyin_config.clone();
+
+        if new_config.character_set != old.character_set {
+            let data_dir = resolve_data_dir(new_config.character_set);
+            let fst_path = std::path::Path::new(&data_dir).join("lexicon.fst");
+            let dat_path = std::path::Path::new(&data_dir).join("lexicon.dat");
+            match libchinese_core::Lexicon::load(&fst_path, &dat_path) {
+                Ok(lexicon) => self.engine.swap_lexicon(lexicon),
+                Err(e) => log::error!(
+                    "Failed to load {:?} lexicon: {}",
+                    new_config.character_set,
+                    e
+                ),
+            }
+        }
+
+        if new_config.candidates_per_page != old.candidates_per_page {
+            self.ime.set_page_size(new_config.candidates_per_page);
+        }
+
+        if new_config.select_keys != old.select_keys {
+            self.ime.set_select_keys(&new_config.select_keys);
+            self.engine.config_mut().select_keys = new_config.select_keys.clone();
+        }
+
+        if new_config.emoji_candidate != old.emoji_candidate {
+            self.engine.set_emoji_enabled(new_config.emoji_candidate);
+        }
+
+        if new_config.english_candidate != old.english_candidate {
+            self.engine.set_english_enabled(new_config.english_candidate);
+        }
+
+        if new_config.sort_by_pinyin_length != old.sort_by_pinyin_length {
+            self.engine
+                .set_sort_by_pinyin_length(new_config.sort_by_pinyin_length);
+        }
+
+        if new_config.double_pinyin_scheme != old.double_pinyin_scheme {
+            self.engine
+                .set_double_pinyin_scheme(new_config.double_pinyin_scheme.clone());
+        }
+
+        if new_config.auto_suggestion != old.auto_suggestion {
+            self.engine.config_mut().auto_suggestion = new_config.auto_suggestion;
+        }
+
+        {
+            let new_fuzzy = build_fuzzy_rules(&new_config);
+            let old_fuzzy = build_fuzzy_rules(&old);
+            if new_fuzzy != old_fuzzy {
+                self.engine.config_mut().fuzzy = new_fuzzy;
+            }
+        }
+
+        if new_config.pinyin_incomplete != old.pinyin_incomplete {
+            self.engine.config_mut().incomplete_penalty = if new_config.pinyin_incomplete {
+                500
+            } else {
+                i32::MAX / 4
+            };
+        }
+
+        for addon in &old.enabled_addons {
+            if !new_config.enabled_addons.contains(addon) {
+                self.engine.set_addon_enabled(addon, false);
+            }
+        }
+        for addon in &new_config.enabled_addons {
+            if !old.enabled_addons.contains(addon) {
+                self.engine.set_addon_enabled(addon, true);
+            }
+        }
+
+        if new_config.default_fullwidth != old.default_fullwidth {
+            self.ime.set_fullwidth(new_config.default_fullwidth);
+        }
+
+        self.pinyin_config = new_config;
+        self.settings_config = self.pinyin_config.clone();
     }
 
     fn preedit(&self) -> &str {
@@ -724,6 +871,15 @@ impl PinyinWl {
     }
 
     fn process_and_sync(&mut self) -> Task<Message> {
+        // Auto-commit when exactly one candidate remains (libpinyin-style AutoCommit).
+        if self.pinyin_config.auto_commit_single
+            && self.candidates().len() == 1
+            && !self.preedit().is_empty()
+            && !self.ime.context().has_commit()
+        {
+            let _ = self.ime.process_key(ImeKeyEvent::Number(1));
+        }
+
         if let Some(text) = self.take_commit() {
             self.engine.commit(&text);
             let preedit = self.preedit().to_owned();
@@ -761,26 +917,6 @@ impl PinyinWl {
     }
 }
 
-/// D-Bus interface for external control of the IME
-struct PinyinWlDbus {
-    tx: mpsc::UnboundedSender<Message>,
-}
-
-#[zbus::interface(name = "com.pinyinwl.InputMethod1")]
-impl PinyinWlDbus {
-    async fn toggle_mode(&self) {
-        let _ = self.tx.send(Message::DbusToggleMode);
-    }
-
-    async fn set_passthrough(&self, passthrough: bool) {
-        let _ = self.tx.send(Message::DbusSetPassthrough(passthrough));
-    }
-
-    async fn toggle_half_full_width(&self) {
-        let _ = self.tx.send(Message::DbusToggleHalfFullWidth);
-    }
-}
-
 /// Subscription that watches pinyin config for changes and emits ConfigChanged.
 fn config_watcher_subscription() -> impl cosmic::iced::futures::Stream<Item = Message> {
     cosmic::iced::stream::channel(1, async |mut sender| {
@@ -808,48 +944,6 @@ fn config_watcher_subscription() -> impl cosmic::iced::futures::Stream<Item = Me
 
         while rx.recv().await.is_some() {
             let _ = sender.send(Message::ConfigChanged).await;
-        }
-    })
-}
-
-/// Subscription that registers D-Bus service and forwards method calls as Messages
-fn dbus_subscription() -> impl cosmic::iced::futures::Stream<Item = Message> {
-    cosmic::iced::stream::channel(10, async |mut sender| {
-        use cosmic::iced::futures::SinkExt;
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-
-        let dbus_obj = PinyinWlDbus { tx };
-
-        let conn = match zbus::Connection::session().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                log::error!("Failed to connect to D-Bus session bus: {}", e);
-                std::future::pending::<()>().await;
-                unreachable!()
-            }
-        };
-
-        if let Err(e) = conn
-            .object_server()
-            .at("/com/pinyinwl/InputMethod1", dbus_obj)
-            .await
-        {
-            log::error!("Failed to register D-Bus object: {}", e);
-            std::future::pending::<()>().await;
-            unreachable!()
-        }
-
-        if let Err(e) = conn.request_name("com.pinyinwl.InputMethod1").await {
-            log::error!("Failed to request D-Bus name: {}", e);
-            std::future::pending::<()>().await;
-            unreachable!()
-        }
-
-        log::info!("D-Bus service registered: com.pinyinwl.InputMethod1");
-
-        while let Some(msg) = rx.recv().await {
-            let _ = sender.send(msg).await;
         }
     })
 }

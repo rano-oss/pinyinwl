@@ -13,8 +13,8 @@ name = "cosmic-applet-pinyin"
 path = "src/applet.rs"
 
 [dependencies]
-libcosmic = { path = "../libcosmic", features = ["wayland", "wayland_input_method", "winit", "applet"] }
-cosmic-comp-config = { path = "../cosmic-comp/cosmic-comp-config" }
+libcosmic = { git = "https://github.com/rano-oss/libcosmic", branch = "input-method-unstable-v3", features = ["wayland", "wayland_input_method", "winit", "applet"] }
+cosmic-comp-config = { git = "https://github.com/rano-oss/cosmic-comp", branch = "input-method-unstable-v3" }
 libpinyin = { path = "../libchinese/libpinyin" }
 libchinese-core = { path = "../libchinese/core" }
 env_logger = "0.10"
@@ -37,8 +37,9 @@ opt-level = "s"
 opt-level = 2
 
 [patch.crates-io]
-wayland-protocols = { path = "../wayland-rs/wayland-protocols" }
-wayland-protocols-experimental = { path = "../wayland-rs/wayland-protocols-experimental" }
+wayland-protocols = { git = "https://github.com/rano-oss/wayland-rs.git", branch = "input-method-unstable-v3" }
+wayland-protocols-experimental = { git = "https://github.com/rano-oss/wayland-rs.git", branch = "input-method-unstable-v3" }
 
 [patch."https://github.com/pop-os/libcosmic"]
-cosmic-config = { path = "../libcosmic/cosmic-config" }
+libcosmic = { git = "https://github.com/rano-oss/libcosmic", branch = "input-method-unstable-v3" }
+cosmic-config = { git = "https://github.com/rano-oss/libcosmic", branch = "input-method-unstable-v3" }

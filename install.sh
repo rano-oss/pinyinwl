@@ -9,7 +9,7 @@
 # Installs:
 #   - pinyinwl binary (IME daemon)
 #   - cosmic-applet-pinyin binary (panel applet)
-#   - Lexicon data (simplified, traditional, emoji, addons)
+#   - Lexicon data (simplified, traditional, emoji, english wordlist, addons)
 #   - Desktop file for the applet
 
 set -e
@@ -97,6 +97,12 @@ do_install() {
     if [ -f "$LIBCHINESE_DIR/data/emoji.table" ]; then
         install -Dm644 "$LIBCHINESE_DIR/data/emoji.table" "$DESTDIR$DATADIR/simplified/emoji.table"
         install -Dm644 "$LIBCHINESE_DIR/data/emoji.table" "$DESTDIR$DATADIR/traditional/emoji.table"
+    fi
+
+    # English mixed-input wordlist (混输)
+    if [ -f "$LIBCHINESE_DIR/data/english.wordlist" ]; then
+        install -Dm644 "$LIBCHINESE_DIR/data/english.wordlist" "$DESTDIR$DATADIR/simplified/english.wordlist"
+        install -Dm644 "$LIBCHINESE_DIR/data/english.wordlist" "$DESTDIR$DATADIR/traditional/english.wordlist"
     fi
 
     # Addon dictionaries
