@@ -2746,6 +2746,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 [[package]]
 name = "libchinese-core"
 version = "0.1.0"
+source = "git+https://github.com/rano-oss/libchinese#22db2f5ec8ca70b22e90e077c31f0b667762f7e3"
 dependencies = [
  "fst",
  "lru",
@@ -2823,9 +2824,9 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 [[package]]
 name = "libpinyin"
 version = "0.1.0"
+source = "git+https://github.com/rano-oss/libchinese#22db2f5ec8ca70b22e90e077c31f0b667762f7e3"
 dependencies = [
  "libchinese-core",
- "log",
  "serde",
 ]
 

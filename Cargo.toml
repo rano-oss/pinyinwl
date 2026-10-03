@@ -10,8 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 libcosmic = { git = "https://github.com/rano-oss/libcosmic", branch = "experimental/xx-im-preedit-start", features = ["wayland", "wayland_input_method", "winit"] }
-libpinyin = { path = "../libchinese/libpinyin" }
-libchinese-core = { path = "../libchinese/core" }
+libpinyin = { git = "https://github.com/rano-oss/libchinese", package = "libpinyin" }
+libchinese-core = { git = "https://github.com/rano-oss/libchinese", package = "libchinese-core" }
 ime-control = { path = "ime-control" }
 env_logger = "0.10"
 log = "0.4"
