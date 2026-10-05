@@ -9,7 +9,7 @@
 # Installs:
 #   - pinyinwl binary (IME daemon)
 #   - cosmic-applet-pinyin binary (panel applet)
-#   - Lexicon data (simplified, traditional, emoji, addons)
+#   - Lexicon data (simplified, traditional, emoji, english wordlist, addons)
 #   - Desktop file for the applet
 
 set -e
@@ -57,12 +57,14 @@ do_build() {
     info "Building pinyinwl (${PROFILE})..."
     cargo build --profile "$PROFILE" --manifest-path "$SCRIPT_DIR/Cargo.toml"
 
-    # Build data if needed
     CONVERTED_DIR="$LIBCHINESE_DIR/data/converted"
-    if [ ! -d "$CONVERTED_DIR/simplified" ]; then
-        info "Building lexicon data..."
-        (cd "$LIBCHINESE_DIR" && cargo run --manifest-path tools/convert_table/Cargo.toml --release)
-    fi
+    info "Building lexicon data (simplified + traditional hybrid)..."
+    (cd "$LIBCHINESE_DIR" && cargo run --manifest-path tools/convert_table/Cargo.toml --release)
+    info "Building word bigrams..."
+    (cd "$LIBCHINESE_DIR" && cargo run --manifest-path tools/gen_word_bigrams/Cargo.toml --release -- \
+        data/interpolation2.text data/converted/simplified)
+    (cd "$LIBCHINESE_DIR" && cargo run --manifest-path tools/gen_word_bigrams/Cargo.toml --release -- \
+        data/zhuyin/interpolation2.text data/converted/traditional)
 
     info "Build complete."
 }
@@ -99,15 +101,27 @@ do_install() {
         install -Dm644 "$LIBCHINESE_DIR/data/emoji.table" "$DESTDIR$DATADIR/traditional/emoji.table"
     fi
 
-    # Addon dictionaries
+    # English mixed-input wordlist (混输)
+    if [ -f "$LIBCHINESE_DIR/data/english.wordlist" ]; then
+        install -Dm644 "$LIBCHINESE_DIR/data/english.wordlist" "$DESTDIR$DATADIR/simplified/english.wordlist"
+        install -Dm644 "$LIBCHINESE_DIR/data/english.wordlist" "$DESTDIR$DATADIR/traditional/english.wordlist"
+    fi
+
+    # Addon dictionaries (simplified copies + traditional s2twp when available)
     if [ -d "$CONVERTED_DIR/addon" ]; then
         for addon_dir in "$CONVERTED_DIR/addon"/*/; do
             [ -d "$addon_dir" ] || continue
             local addon_name="$(basename "$addon_dir")"
             install -Dm644 "$addon_dir/lexicon.fst" "$DESTDIR$DATADIR/simplified/addon/$addon_name/lexicon.fst"
             install -Dm644 "$addon_dir/lexicon.dat" "$DESTDIR$DATADIR/simplified/addon/$addon_name/lexicon.dat"
-            install -Dm644 "$addon_dir/lexicon.fst" "$DESTDIR$DATADIR/traditional/addon/$addon_name/lexicon.fst"
-            install -Dm644 "$addon_dir/lexicon.dat" "$DESTDIR$DATADIR/traditional/addon/$addon_name/lexicon.dat"
+            local trad_addon="$CONVERTED_DIR/traditional/addon/$addon_name"
+            if [ -d "$trad_addon" ]; then
+                install -Dm644 "$trad_addon/lexicon.fst" "$DESTDIR$DATADIR/traditional/addon/$addon_name/lexicon.fst"
+                install -Dm644 "$trad_addon/lexicon.dat" "$DESTDIR$DATADIR/traditional/addon/$addon_name/lexicon.dat"
+            else
+                install -Dm644 "$addon_dir/lexicon.fst" "$DESTDIR$DATADIR/traditional/addon/$addon_name/lexicon.fst"
+                install -Dm644 "$addon_dir/lexicon.dat" "$DESTDIR$DATADIR/traditional/addon/$addon_name/lexicon.dat"
+            fi
         done
     fi
 
