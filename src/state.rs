@@ -17,17 +17,21 @@ use crate::Message;
 /// Default data directory for libpinyin model files
 const DATA_DIR: &str = "/usr/share/libpinyin/data";
 
-/// Handshake for StartOfPreedit popup lock (engine preedit is source of truth).
+
+
+/// StartOfPreedit probe: caret-at-0 commit, then real caret after IM `Done`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AnchorPhase {
-    /// Preedit empty — popup follows the text cursor.
     #[default]
     Idle,
     /// Caret-at-0 preedit sent; waiting for Done before real caret.
     Probing,
-    /// Commit sent; waiting for Done before caret-at-0 re-lock.
-    PartialCommitPending,
     Composing,
+    /// Partial commit flushed; next Done re-anchors like a fresh composition.
+    ReanchorPending,
+    /// Re-anchor probe in flight; leave caret at 0 so the latch takes the
+    /// start rect (syncing to the end immediately raced and locked the end).
+    ReanchorProbing,
 }
 
 pub struct InputMethodState {
@@ -46,7 +50,8 @@ impl InputMethodState {
         let data_dir = resolve_data_dir(pinyin_config.character_set);
         let engine = Engine::from_data_dir(&data_dir).unwrap_or_else(|e| {
             log::error!("Failed to load pinyin data from {}: {}", data_dir, e);
-            log::error!("Set PINYINWL_DATA_DIR to point to a directory containing lexicon.fst + lexicon.dat + word_bigram.dat + word_bigram_words.fst");
+            log::error!("Set PINYINWL_DATA_DIR to a directory with lexicon.fst + lexicon.dat + word_bigram.dat + word_bigram_words.fst");
+            log::error!("If the error is 'Database already open', another pinyinwl holds ~/.pinyin/userdict.redb — set LIBCHINESE_USERDICT (or PINYINWL_DATA_DIR, which now uses <data_dir>/userdict.redb)");
             std::process::exit(1);
         });
         let mut ime = ImeEngine::from_arc_with_page_size(
@@ -281,7 +286,12 @@ impl InputMethodState {
     }
 
     fn cursor_byte_position(&self) -> i32 {
-        self.ime.context().preedit_cursor as i32
+        let preedit = self.preedit();
+        let mut c = self.ime.context().preedit_cursor.min(preedit.len());
+        while c > 0 && !preedit.is_char_boundary(c) {
+            c -= 1;
+        }
+        c as i32
     }
 
     fn take_commit(&mut self) -> Option<String> {
@@ -294,10 +304,18 @@ impl InputMethodState {
     }
 
     pub fn send_commit(&self, text: String) -> Task<Message> {
-        Task::batch([
-            input_method::commit_string(text),
-            input_method::commit(),
-        ])
+        input_method::commit_string(text).chain(input_method::commit())
+    }
+
+    /// One `done` with commit + remaining preedit at caret 0 (keeps commit on time).
+    /// Popup re-anchors on the following IM `Done` via [`AnchorPhase::ReanchorPending`].
+    /// Caret stays at 0 through [`AnchorPhase::ReanchorProbing`] so StartOfPreedit
+    /// latches the new start; the next key's `sync_preedit` moves the caret.
+    fn send_partial_commit(&mut self, text: String, preedit: String) -> Task<Message> {
+        self.anchor_phase = AnchorPhase::ReanchorPending;
+        input_method::commit_string(text)
+            .chain(input_method::set_preedit_string(preedit, 0, 0))
+            .chain(input_method::commit())
     }
 
     fn follow_cursor_sync(&mut self) -> Task<Message> {
@@ -310,38 +328,51 @@ impl InputMethodState {
         ])
     }
 
-    fn probe_preedit_at_zero(preedit: String) -> Task<Message> {
-        Task::batch([
-            input_method::set_preedit_string(preedit, 0, 0),
-            input_method::commit(),
-        ])
-    }
-
     fn start_preedit_anchor(&mut self, preedit: String) -> Task<Message> {
         self.anchor_phase = AnchorPhase::Probing;
-        Task::batch([
-            input_method::set_popup_position_mode(PopupPositionMode::StartOfPreedit),
-            Self::probe_preedit_at_zero(preedit),
-        ])
+        input_method::set_popup_position_mode(PopupPositionMode::StartOfPreedit)
+            .chain(input_method::set_preedit_string(preedit, 0, 0))
+            .chain(input_method::commit())
     }
 
-    fn send_preedit_sync(&self, preedit: String) -> Task<Message> {
-        let cursor = self.cursor_byte_position();
-        Task::batch([
-            input_method::set_preedit_string(preedit, cursor, cursor),
-            input_method::commit(),
-        ])
+    fn sync_preedit(&self) -> Task<Message> {
+        let preedit = self.preedit().to_owned();
+        if preedit.is_empty() {
+            Task::batch([
+                input_method::set_preedit_string(String::new(), 0, 0),
+                input_method::commit(),
+            ])
+        } else {
+            let cursor = self.cursor_byte_position();
+            Task::batch([
+                input_method::set_preedit_string(preedit, cursor, cursor),
+                input_method::commit(),
+            ])
+        }
     }
 
     pub fn handle_done(&mut self) -> Task<Message> {
         match self.anchor_phase {
             AnchorPhase::Probing => {
                 self.anchor_phase = AnchorPhase::Composing;
-                self.send_preedit_sync(self.preedit().to_owned())
+                self.sync_preedit()
             }
-            AnchorPhase::PartialCommitPending => {
-                self.anchor_phase = AnchorPhase::Probing;
-                Self::probe_preedit_at_zero(self.preedit().to_owned())
+            AnchorPhase::ReanchorPending => {
+                let preedit = self.preedit().to_owned();
+                if preedit.is_empty() {
+                    self.follow_cursor_sync()
+                } else {
+                    // Same probe as a fresh composition, but do not sync caret to
+                    // the end on the next Done — that raced the latch onto the end.
+                    self.anchor_phase = AnchorPhase::ReanchorProbing;
+                    input_method::set_popup_position_mode(PopupPositionMode::StartOfPreedit)
+                        .chain(input_method::set_preedit_string(preedit, 0, 0))
+                        .chain(input_method::commit())
+                }
+            }
+            AnchorPhase::ReanchorProbing => {
+                self.anchor_phase = AnchorPhase::Composing;
+                Task::none()
             }
             _ => Task::none(),
         }
@@ -349,6 +380,10 @@ impl InputMethodState {
 
     pub fn process_key_and_sync(&mut self) -> Task<Message> {
         if self.pinyin_config.auto_commit_single
+            && matches!(
+                self.anchor_phase,
+                AnchorPhase::Idle | AnchorPhase::Composing
+            )
             && self.candidates().len() == 1
             && !self.preedit().is_empty()
             && !self.ime.context().has_commit()
@@ -365,24 +400,36 @@ impl InputMethodState {
                     input_method::set_popup_position_mode(PopupPositionMode::FollowCursor),
                     input_method::reset_popup_size(),
                     self.send_commit(text),
+                    self.sync_preedit(),
                 ]);
             }
-            self.anchor_phase = AnchorPhase::PartialCommitPending;
-            return self.send_commit(text);
+            return self.send_partial_commit(text, preedit);
         }
 
         let preedit = self.preedit().to_owned();
         if preedit.is_empty() {
-            self.follow_cursor_sync()
+            // Only push FollowCursor + empty preedit when leaving a composing
+            // handshake. Re-sending empty commit on every idle Handled key
+            // (suggestion Enter/Backspace, etc.) floods Alacritty's IME path.
+            if self.anchor_phase != AnchorPhase::Idle {
+                self.follow_cursor_sync()
+            } else {
+                Task::batch([
+                    input_method::set_popup_position_mode(PopupPositionMode::FollowCursor),
+                    input_method::reset_popup_size(),
+                ])
+            }
         } else if self.anchor_phase == AnchorPhase::Idle {
             self.start_preedit_anchor(preedit)
         } else if matches!(
             self.anchor_phase,
-            AnchorPhase::Probing | AnchorPhase::PartialCommitPending
+            AnchorPhase::Probing
+                | AnchorPhase::ReanchorPending
+                | AnchorPhase::ReanchorProbing
         ) {
             Task::none()
         } else {
-            self.send_preedit_sync(preedit)
+            self.sync_preedit()
         }
     }
 

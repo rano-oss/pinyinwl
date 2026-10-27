@@ -142,33 +142,92 @@ impl cosmic::Application for PinyinWl {
         let state = &mut self.state;
         match message {
             Message::Activate => {
+                log::info!(
+                    "activate passthrough={} phase={:?} preedit={:?} mode={}",
+                    state.ime.is_passthrough(),
+                    state.anchor_phase,
+                    state.preedit(),
+                    state.mode_status_text()
+                );
                 state.ime.reset();
                 state.anchor_phase = AnchorPhase::Idle;
                 state.publish_mode_status();
                 wrap(input_method::set_popup_position_mode(PopupPositionMode::FollowCursor))
             }
-            Message::Deactivate => wrap(apply_switch_im_behavior(state)),
+            Message::Deactivate => {
+                log::info!(
+                    "deactivate passthrough={} phase={:?} preedit={:?}",
+                    state.ime.is_passthrough(),
+                    state.anchor_phase,
+                    state.preedit()
+                );
+                wrap(apply_switch_im_behavior(state))
+            }
             Message::KeyPressed(key_event, key, modifiers, serial) => {
                 // serial == 0: client-side key repeat (same Message as Press).
                 if serial == 0 {
                     return handle_key_repeat(state, key, serial);
                 }
+                log::info!(
+                    "press serial={serial} raw={} key={key:?} keysym={:#x} utf8={:?} \
+                     shift_set={} passthrough={} phase={:?} preedit={:?}",
+                    key_event.raw_code,
+                    key_event.keysym,
+                    key_event.utf8,
+                    state.shift_set,
+                    state.ime.is_passthrough(),
+                    state.anchor_phase,
+                    state.preedit()
+                );
                 handle_key_press(state, key_event, key, modifiers, serial)
             }
             Message::KeyReleased(key_event, key, _modifiers, serial) => {
                 let raw_code = key_event.raw_code;
                 let was_consumed = state.consumed_keys.remove(&raw_code);
 
-                if key == Key::Named(Named::Shift) && state.shift_set {
+                let is_shift = raw_code == 42 || raw_code == 54 || key == Key::Named(Named::Shift);
+                if is_shift && state.shift_set {
                     state.shift_set = false;
                     let english = !state.ime.is_passthrough();
+                    log::info!(
+                        "shift-toggle serial={serial} raw={raw_code} -> english={english} mode={}",
+                        if english { "英" } else { "中" }
+                    );
                     let cmd = state.set_english_mode(english);
                     wrap(Task::batch(vec![cmd, input_method::filter_key(serial, true)]))
                 } else {
+                    if is_shift {
+                        log::info!(
+                            "shift-release serial={serial} raw={raw_code} ignored shift_set={} was_consumed={was_consumed}",
+                            state.shift_set
+                        );
+                    }
                     wrap(input_method::filter_key(serial, was_consumed))
                 }
             }
-            Message::Modifiers(_modifiers) => Task::none(),
+            Message::Modifiers(modifiers) => {
+                log::info!(
+                    "modifiers shift={} ctrl={} alt={} logo={} shift_set={}",
+                    modifiers.shift,
+                    modifiers.ctrl,
+                    modifiers.alt,
+                    modifiers.logo,
+                    state.shift_set
+                );
+                // Fallback when Shift Key press/release never reaches the IME.
+                if modifiers.shift {
+                    state.shift_set = true;
+                } else if state.shift_set {
+                    state.shift_set = false;
+                    let english = !state.ime.is_passthrough();
+                    log::info!(
+                        "shift-toggle via modifiers -> english={english} mode={}",
+                        if english { "英" } else { "中" }
+                    );
+                    return wrap(state.set_english_mode(english));
+                }
+                Task::none()
+            }
             Message::Done => wrap(state.handle_done()),
             Message::SelectCandidate(n) => {
                 if n == 0 || state.candidates().is_empty() {
@@ -339,6 +398,32 @@ fn handle_key_press(
 ) -> Task<CosmicAction> {
     let raw_code = key_event.raw_code;
 
+    // Empty preedit + suggestion candidates: dismiss chrome without feeding
+    // Backspace/Enter into the suggestion editor (its PassThrough path reset()s
+    // mid-handler and then races the client key).
+    if state.preedit().is_empty() && !state.candidates().is_empty() {
+        if key == Key::Named(Named::Backspace) {
+            state.ime.reset();
+            state.anchor_phase = AnchorPhase::Idle;
+            state.consumed_keys.remove(&raw_code);
+            return wrap(Task::batch([
+                input_method::set_popup_position_mode(PopupPositionMode::FollowCursor),
+                input_method::reset_popup_size(),
+                input_method::filter_key(serial, false),
+            ]));
+        }
+        if key == Key::Named(Named::Enter) {
+            state.ime.reset();
+            state.anchor_phase = AnchorPhase::Idle;
+            state.consumed_keys.insert(raw_code);
+            return wrap(Task::batch([
+                input_method::set_popup_position_mode(PopupPositionMode::FollowCursor),
+                input_method::reset_popup_size(),
+                input_method::filter_key(serial, true),
+            ]));
+        }
+    }
+
     // Ctrl+Shift+F: toggle 简/繁 when idle.
     if modifiers.ctrl
         && modifiers.shift
@@ -461,7 +546,7 @@ fn handle_key_press(
                 })
         };
         if let Some(ime_key) = ime_key {
-            if state.ime.process_key(ime_key) == KeyResult::Handled {
+            if state.ime.process_key(ime_key.clone()) == KeyResult::Handled {
                 state.shift_set = false;
                 state.consumed_keys.insert(raw_code);
                 return wrap(Task::batch([
@@ -472,7 +557,9 @@ fn handle_key_press(
         }
     }
 
-    if key == Key::Named(Named::Shift) {
+    // Evdev/wkb codes (filter delivers these), not xkb.
+    let is_shift = raw_code == 42 || raw_code == 54 || key == Key::Named(Named::Shift);
+    if is_shift {
         state.shift_set = true;
         state.consumed_keys.insert(raw_code);
         return wrap(input_method::filter_key(serial, true));
