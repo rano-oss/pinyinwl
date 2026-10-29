@@ -151,6 +151,8 @@ impl cosmic::Application for PinyinWl {
                 );
                 state.ime.reset();
                 state.anchor_phase = AnchorPhase::Idle;
+                state.shift_set = false;
+                state.shift_held = false;
                 state.publish_mode_status();
                 wrap(input_method::set_popup_position_mode(PopupPositionMode::FollowCursor))
             }
@@ -161,6 +163,8 @@ impl cosmic::Application for PinyinWl {
                     state.anchor_phase,
                     state.preedit()
                 );
+                state.shift_set = false;
+                state.shift_held = false;
                 wrap(apply_switch_im_behavior(state))
             }
             Message::KeyPressed(key_event, key, modifiers, serial) => {
@@ -186,45 +190,57 @@ impl cosmic::Application for PinyinWl {
                 let was_consumed = state.consumed_keys.remove(&raw_code);
 
                 let is_shift = raw_code == 42 || raw_code == 54 || key == Key::Named(Named::Shift);
-                if is_shift && state.shift_set {
-                    state.shift_set = false;
-                    let english = !state.ime.is_passthrough();
-                    log::info!(
-                        "shift-toggle serial={serial} raw={raw_code} -> english={english} mode={}",
-                        if english { "英" } else { "中" }
-                    );
-                    let cmd = state.set_english_mode(english);
-                    wrap(Task::batch(vec![cmd, input_method::filter_key(serial, true)]))
-                } else {
-                    if is_shift {
+                if is_shift {
+                    state.shift_held = false;
+                    if state.shift_set {
+                        state.shift_set = false;
+                        let english = !state.ime.is_passthrough();
                         log::info!(
-                            "shift-release serial={serial} raw={raw_code} ignored shift_set={} was_consumed={was_consumed}",
-                            state.shift_set
+                            "shift-toggle serial={serial} raw={raw_code} -> english={english} mode={}",
+                            if english { "英" } else { "中" }
                         );
+                        let cmd = state.set_english_mode(english);
+                        return wrap(Task::batch(vec![
+                            cmd,
+                            input_method::filter_key(serial, true),
+                        ]));
                     }
-                    wrap(input_method::filter_key(serial, was_consumed))
+                    log::info!(
+                        "shift-release serial={serial} raw={raw_code} ignored shift_set={} was_consumed={was_consumed}",
+                        state.shift_set
+                    );
                 }
+                wrap(input_method::filter_key(serial, was_consumed))
             }
             Message::Modifiers(modifiers) => {
                 log::info!(
-                    "modifiers shift={} ctrl={} alt={} logo={} shift_set={}",
+                    "modifiers shift={} ctrl={} alt={} logo={} shift_set={} shift_held={}",
                     modifiers.shift,
                     modifiers.ctrl,
                     modifiers.alt,
                     modifiers.logo,
-                    state.shift_set
+                    state.shift_set,
+                    state.shift_held
                 );
                 // Fallback when Shift Key press/release never reaches the IME.
+                // Rising edge only — never re-arm after Shift+letter cleared shift_set
+                // (capitals in 英 mode), including late modifiers after the letter.
                 if modifiers.shift {
-                    state.shift_set = true;
-                } else if state.shift_set {
-                    state.shift_set = false;
-                    let english = !state.ime.is_passthrough();
-                    log::info!(
-                        "shift-toggle via modifiers -> english={english} mode={}",
-                        if english { "英" } else { "中" }
-                    );
-                    return wrap(state.set_english_mode(english));
+                    if !state.shift_held {
+                        state.shift_held = true;
+                        state.shift_set = true;
+                    }
+                } else if state.shift_held {
+                    state.shift_held = false;
+                    if state.shift_set {
+                        state.shift_set = false;
+                        let english = !state.ime.is_passthrough();
+                        log::info!(
+                            "shift-toggle via modifiers -> english={english} mode={}",
+                            if english { "英" } else { "中" }
+                        );
+                        return wrap(state.set_english_mode(english));
+                    }
                 }
                 Task::none()
             }
@@ -560,6 +576,7 @@ fn handle_key_press(
     // Evdev/wkb codes (filter delivers these), not xkb.
     let is_shift = raw_code == 42 || raw_code == 54 || key == Key::Named(Named::Shift);
     if is_shift {
+        state.shift_held = true;
         state.shift_set = true;
         state.consumed_keys.insert(raw_code);
         return wrap(input_method::filter_key(serial, true));
@@ -567,7 +584,8 @@ fn handle_key_press(
 
     // Any other key cancels a pending Shift 中/英 toggle. Otherwise Shift+letter
     // (capitals in 英 passthrough, or accidental caps while composing) flips mode
-    // when Shift is released.
+    // when Shift is released. Keep shift_held so a late Modifiers(shift=true)
+    // cannot re-arm the toggle for this hold.
     state.shift_set = false;
 
     // Shift+Space toggles fullwidth (ibus-libpinyin style), including in 英 mode.
