@@ -38,7 +38,11 @@ pub struct InputMethodState {
     pub engine: Engine,
     pub ime: ImeEngine<Parser>,
     pub pinyin_config: PinyinConfig,
+    /// Pending 中/英 toggle on Shift release (cleared if another key is pressed).
     pub shift_set: bool,
+    /// Shift is down for this hold (key and/or modifiers). Prevents Modifiers from
+    /// re-arming `shift_set` after Shift+letter cancelled the toggle.
+    pub shift_held: bool,
     pub popup_id: window::Id,
     pub anchor_phase: AnchorPhase,
     /// Track raw_codes of key presses that were consumed (filtered).
@@ -101,6 +105,7 @@ impl InputMethodState {
             ime,
             pinyin_config,
             shift_set: false,
+            shift_held: false,
             popup_id: window::Id::NONE,
             anchor_phase: AnchorPhase::Idle,
             consumed_keys: HashSet::new(),
