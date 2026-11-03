@@ -2,8 +2,10 @@
 
 use std::collections::HashSet;
 
-use libchinese_core::{ImeEngine, KeyEvent as ImeKeyEvent};
-use libpinyin::{parser::Parser, Engine};
+use libchinese_core::{
+    CandidateRankMode, ImeEngine, InputPurpose, KeyEvent as ImeKeyEvent, Lexicon, WordBigram,
+};
+use libpinyin::{Engine, Parser};
 
 use cosmic::iced::platform_specific::shell::wayland::commands::input_method::{
     self, PopupPositionMode,
@@ -35,7 +37,6 @@ pub enum AnchorPhase {
 }
 
 pub struct InputMethodState {
-    pub engine: Engine,
     pub ime: ImeEngine<Parser>,
     pub pinyin_config: PinyinConfig,
     /// Pending 中/英 toggle on Shift release (cleared if another key is pressed).
@@ -52,24 +53,15 @@ pub struct InputMethodState {
 impl InputMethodState {
     pub fn new(pinyin_config: PinyinConfig) -> Self {
         let data_dir = resolve_data_dir(pinyin_config.character_set);
-        let engine = Engine::from_data_dir(&data_dir).unwrap_or_else(|e| {
+        let mut engine = Engine::from_data_dir(&data_dir).unwrap_or_else(|e| {
             log::error!("Failed to load pinyin data from {}: {}", data_dir, e);
             log::error!("Set PINYINWL_DATA_DIR to a directory with lexicon.fst + lexicon.dat + word_bigram.dat + word_bigram_words.fst");
             log::error!("If the error is 'Database already open', another pinyinwl holds ~/.pinyin/userdict.redb — set LIBCHINESE_USERDICT (or PINYINWL_DATA_DIR, which now uses <data_dir>/userdict.redb)");
             std::process::exit(1);
         });
-        let mut ime = ImeEngine::from_arc_with_page_size(
-            engine.inner_arc(),
-            pinyin_config.candidates_per_page,
-        );
-        if pinyin_config.default_fullwidth {
-            ime.set_fullwidth(true);
-        }
-        if pinyin_config.select_keys != "123456789" {
-            ime.set_select_keys(&pinyin_config.select_keys);
-        }
-        // Profile first (sentences / rank / mixed-input defaults), then fine overrides.
-        engine.set_profile(pinyin_config.ime_profile);
+        // Reinforce Best UX (also the libchinese defaults) + user toggles.
+        engine.set_emit_composed_sentences(true);
+        engine.set_candidate_rank_mode(CandidateRankMode::MatchedSpanThenScore);
         engine.set_emoji_enabled(pinyin_config.emoji_candidate);
         engine.set_english_enabled(pinyin_config.english_candidate);
         engine.set_sort_by_pinyin_length(pinyin_config.sort_by_pinyin_length);
@@ -83,6 +75,11 @@ impl InputMethodState {
             let mut cfg = engine.config_mut();
             cfg.fuzzy = build_fuzzy_rules(&pinyin_config);
             cfg.auto_suggestion = pinyin_config.auto_suggestion;
+            cfg.min_suggestion_trigger_length = if pinyin_config.auto_suggestion {
+                1
+            } else {
+                2
+            };
             cfg.learning_enabled = pinyin_config.learning_enabled;
             cfg.chinese_punctuation = pinyin_config.chinese_punctuation;
             cfg.v_mode_enabled = pinyin_config.v_mode_enabled;
@@ -100,8 +97,17 @@ impl InputMethodState {
         for addon_name in &pinyin_config.enabled_addons {
             engine.set_addon_enabled(addon_name, true);
         }
+        let mut ime = ImeEngine::with_page_size(
+            engine.into_inner(),
+            pinyin_config.candidates_per_page,
+        );
+        if pinyin_config.default_fullwidth {
+            ime.set_fullwidth(true);
+        }
+        if pinyin_config.select_keys != "123456789" {
+            ime.set_select_keys(&pinyin_config.select_keys);
+        }
         Self {
-            engine,
             ime,
             pinyin_config,
             shift_set: false,
@@ -194,20 +200,19 @@ impl InputMethodState {
         if charset_changed {
             let data_dir = resolve_data_dir(self.pinyin_config.character_set);
             let dir = std::path::Path::new(&data_dir);
-            match libchinese_core::Lexicon::load(&dir.join("lexicon.fst"), &dir.join("lexicon.dat"))
-            {
-                Ok(lex) => self.engine.swap_lexicon(lex),
+            match Lexicon::load(&dir.join("lexicon.fst"), &dir.join("lexicon.dat")) {
+                Ok(lex) => self.ime.backend_mut().swap_lexicon(lex),
                 Err(e) => log::error!(
                     "Failed to load {:?} lexicon: {}",
                     self.pinyin_config.character_set,
                     e
                 ),
             }
-            match libchinese_core::WordBigram::load(
+            match WordBigram::load(
                 &dir.join("word_bigram.dat"),
                 &dir.join("word_bigram_words.fst"),
             ) {
-                Ok(wb) => self.engine.swap_word_bigram(wb),
+                Ok(wb) => self.ime.backend_mut().swap_word_bigram(wb),
                 Err(e) => log::error!(
                     "Failed to load {:?} word_bigram: {}",
                     self.pinyin_config.character_set,
@@ -221,7 +226,7 @@ impl InputMethodState {
         self.ime.set_select_keys(&c.select_keys);
         self.ime.set_fullwidth(c.default_fullwidth);
         {
-            let mut cfg = self.engine.config_mut();
+            let mut cfg = self.ime.backend_mut().config_mut();
             cfg.select_keys = c.select_keys.clone();
             cfg.auto_suggestion = c.auto_suggestion;
             cfg.learning_enabled = c.learning_enabled;
@@ -237,26 +242,32 @@ impl InputMethodState {
                 i32::MAX / 4
             };
             cfg.choose_char_from_phrase = c.choose_char_from_phrase;
+            cfg.min_suggestion_trigger_length = if c.auto_suggestion { 1 } else { 2 };
         }
-        self.engine.set_profile(c.ime_profile);
-        self.engine.set_emoji_enabled(c.emoji_candidate);
-        self.engine.set_english_enabled(c.english_candidate);
-        self.engine
+        self.ime.backend_mut().set_emit_composed_sentences(true);
+        self.ime
+            .backend_mut()
+            .set_candidate_rank_mode(CandidateRankMode::MatchedSpanThenScore);
+        self.ime.backend_mut().set_emoji_enabled(c.emoji_candidate);
+        self.ime.backend_mut().set_english_enabled(c.english_candidate);
+        self.ime
+            .backend_mut()
             .set_sort_by_pinyin_length(c.sort_by_pinyin_length);
-        self.engine
+        self.ime
+            .backend_mut()
             .set_double_pinyin_scheme(c.double_pinyin_scheme.clone());
-        self.engine.set_allow_fuzzy(
+        self.ime.backend_mut().set_allow_fuzzy(
             c.fuzzy_pinyin || c.pinyin_incomplete || c.correct_pinyin,
         );
 
         for addon in &old_addons {
             if !c.enabled_addons.contains(addon) {
-                self.engine.set_addon_enabled(addon, false);
+                self.ime.backend_mut().set_addon_enabled(addon, false);
             }
         }
         for addon in &c.enabled_addons {
             if !old_addons.contains(addon) {
-                self.engine.set_addon_enabled(addon, true);
+                self.ime.backend_mut().set_addon_enabled(addon, true);
             }
         }
     }
@@ -272,6 +283,31 @@ impl InputMethodState {
         cfg.save();
         self.apply_config_diff(cfg);
         self.publish_mode_status();
+    }
+
+    pub fn set_input_purpose(&mut self, purpose: InputPurpose) {
+        self.ime.set_input_purpose(purpose);
+    }
+
+    pub fn set_content_type(&mut self, hint: u32, purpose: u32) {
+        const HINT_HIDDEN_TEXT: u32 = 0x40;
+        const HINT_SENSITIVE_DATA: u32 = 0x80;
+        let mapped = match purpose {
+            2 | 3 => InputPurpose::Number,
+            4 => InputPurpose::Phone,
+            5 => InputPurpose::Url,
+            6 => InputPurpose::Email,
+            8 | 9 => InputPurpose::Password,
+            13 => InputPurpose::Terminal,
+            _ => InputPurpose::FreeForm,
+        };
+        let mapped = if hint & (HINT_HIDDEN_TEXT | HINT_SENSITIVE_DATA) != 0 {
+            InputPurpose::Password
+        } else {
+            mapped
+        };
+        log::info!("content_type hint={hint:#x} raw_purpose={purpose} -> {mapped:?}");
+        self.set_input_purpose(mapped);
     }
 
     pub fn preedit(&self) -> &str {
@@ -397,7 +433,7 @@ impl InputMethodState {
         }
 
         if let Some(text) = self.take_commit() {
-            self.engine.commit(&text);
+            self.ime.backend_mut().commit(&text);
             let preedit = self.preedit().to_owned();
             if preedit.is_empty() {
                 self.anchor_phase = AnchorPhase::Idle;
@@ -458,9 +494,12 @@ impl InputMethodState {
             // ←/→ always move the preedit cursor while composing.
             Key::Named(Named::ArrowLeft) => Some(ImeKeyEvent::Left),
             Key::Named(Named::ArrowRight) => Some(ImeKeyEvent::Right),
+            Key::Named(Named::Home) => Some(ImeKeyEvent::Home),
+            Key::Named(Named::End) => Some(ImeKeyEvent::End),
             Key::Named(Named::PageDown) => Some(ImeKeyEvent::PageDown),
             Key::Named(Named::PageUp) => Some(ImeKeyEvent::PageUp),
             Key::Named(Named::Backspace) => Some(ImeKeyEvent::Backspace),
+            Key::Named(Named::Delete) => Some(ImeKeyEvent::Delete),
             _ => None,
         };
         if nav_only {

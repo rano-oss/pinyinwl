@@ -79,7 +79,11 @@ do_install() {
 
     info "Installing binaries to $DESTDIR$BINDIR..."
     install -Dm755 "$TARGET_DIR/pinyinwl" "$DESTDIR$BINDIR/pinyinwl"
-    install -Dm755 "$TARGET_DIR/cosmic-applet-pinyin" "$DESTDIR$BINDIR/cosmic-applet-pinyin"
+    if [ -f "$TARGET_DIR/cosmic-applet-pinyin" ]; then
+        install -Dm755 "$TARGET_DIR/cosmic-applet-pinyin" "$DESTDIR$BINDIR/cosmic-applet-pinyin"
+    else
+        info "Skipping cosmic-applet-pinyin (not in this build)"
+    fi
 
     info "Installing data to $DESTDIR$DATADIR..."
 
@@ -125,20 +129,23 @@ do_install() {
         done
     fi
 
-    # Desktop file
-    info "Installing desktop file..."
-    install -Dm644 "$SCRIPT_DIR/data/com.system76.CosmicAppletPinyin.desktop" \
-        "$DESTDIR$APPDIR/com.system76.CosmicAppletPinyin.desktop"
+    # Desktop file (optional applet)
+    if [ -f "$SCRIPT_DIR/data/com.system76.CosmicAppletPinyin.desktop" ]; then
+        info "Installing desktop file..."
+        install -Dm644 "$SCRIPT_DIR/data/com.system76.CosmicAppletPinyin.desktop" \
+            "$DESTDIR$APPDIR/com.system76.CosmicAppletPinyin.desktop"
+    fi
 
     echo ""
     info "Installation complete!"
     echo ""
-    echo "  Binaries:  $DESTDIR$BINDIR/pinyinwl"
-    echo "             $DESTDIR$BINDIR/cosmic-applet-pinyin"
+    echo "  Binary:    $DESTDIR$BINDIR/pinyinwl"
+    [ -f "$DESTDIR$BINDIR/cosmic-applet-pinyin" ] && \
+        echo "             $DESTDIR$BINDIR/cosmic-applet-pinyin"
     echo "  Data:      $DESTDIR$DATADIR/"
-    echo "  Desktop:   $DESTDIR$APPDIR/com.system76.CosmicAppletPinyin.desktop"
     echo ""
     echo "  To configure: pinyinwl --settings"
+    echo "  Restart the IME (or log out/in) to pick up the new build."
 }
 
 # --- Main ---

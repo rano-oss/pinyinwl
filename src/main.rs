@@ -3,7 +3,9 @@ mod settings;
 mod state;
 mod view;
 
-use libchinese_core::{KeyEvent as ImeKeyEvent, KeyResult};
+use libchinese_core::{
+    preferred_chinese_punct, utils, KeyEvent as ImeKeyEvent, KeyResult,
+};
 
 use cosmic::app::Core;
 use cosmic::iced::core::event::wayland::input_method::{
@@ -56,6 +58,7 @@ struct PinyinWl {
 pub enum Message {
     Activate,
     Deactivate,
+    ContentType { hint: u32, purpose: u32 },
     KeyPressed(KeyEvent, Key, Modifiers, u32),
     KeyReleased(KeyEvent, Key, Modifiers, u32),
     Modifiers(Modifiers),
@@ -126,11 +129,6 @@ impl cosmic::Application for PinyinWl {
             )
             .map(Message::Settings);
         }
-        // While settings is open, keep the IM popup content empty so the shared
-        // app clear color can be opaque (see style()).
-        if self.settings_window.is_some() {
-            return widget::Space::new().width(0).height(0).into();
-        }
         view::view(&self.state, id)
     }
 
@@ -149,12 +147,17 @@ impl cosmic::Application for PinyinWl {
                     state.preedit(),
                     state.mode_status_text()
                 );
+                state.set_input_purpose(libchinese_core::InputPurpose::FreeForm);
                 state.ime.reset();
                 state.anchor_phase = AnchorPhase::Idle;
                 state.shift_set = false;
                 state.shift_held = false;
                 state.publish_mode_status();
                 wrap(input_method::set_popup_position_mode(PopupPositionMode::FollowCursor))
+            }
+            Message::ContentType { hint, purpose } => {
+                state.set_content_type(hint, purpose);
+                Task::none()
             }
             Message::Deactivate => {
                 log::info!(
@@ -333,6 +336,9 @@ impl cosmic::Application for PinyinWl {
             ) => match event {
                 InputMethodEvent::Activate => Some(Message::Activate),
                 InputMethodEvent::Deactivate => Some(Message::Deactivate),
+                InputMethodEvent::ContentType { hint, purpose } => {
+                    Some(Message::ContentType { hint, purpose })
+                }
                 InputMethodEvent::Done => Some(Message::Done),
                 _ => None,
             },
@@ -366,18 +372,13 @@ impl cosmic::Application for PinyinWl {
     }
 
     fn style(&self) -> Option<cosmic::iced::theme::Style> {
+        // Single clear color for all windows — must stay transparent or the IM
+        // popup surface paints as a solid cursor-following box. Settings fills
+        // its own opaque background in-view.
         let cosmic = cosmic::theme::active();
         let cosmic = cosmic.cosmic();
-        // iced has a single clear color for all windows. Keep it transparent
-        // while only the IM popup is alive; switch to opaque while settings is
-        // open (popup content is forced empty in view_window).
-        let background_color = if self.settings_window.is_some() {
-            Color::from(cosmic.bg_color())
-        } else {
-            Color::TRANSPARENT
-        };
         Some(cosmic::iced::theme::Style {
-            background_color,
+            background_color: Color::TRANSPARENT,
             text_color: cosmic.on_bg_color().into(),
             icon_color: cosmic.on_bg_color().into(),
         })
@@ -396,8 +397,6 @@ impl PinyinWl {
             ..Default::default()
         });
         self.settings_window = Some(id);
-        // Collapse IM popup immediately; avoid remount flicker while the
-        // shared clear color switches to opaque for the settings window.
         wrap(Task::batch([
             input_method::reset_popup_size(),
             open.map(|_| Message::SettingsOpened),
@@ -551,7 +550,7 @@ fn handle_key_press(
                             if ch.is_ascii_lowercase() {
                                 Some(ImeKeyEvent::Char(ch))
                             } else if state.pinyin_config.chinese_punctuation
-                                && libchinese_core::preferred_chinese_punct(ch).is_some()
+                                && preferred_chinese_punct(ch).is_some()
                                 && page_alias(&key, &state.pinyin_config).is_none()
                             {
                                 Some(ImeKeyEvent::Char(ch))
@@ -601,7 +600,7 @@ fn handle_key_press(
         if state.ime.is_fullwidth() && ch.is_ascii() && ch != '\n' && ch != '\r' {
             state.consumed_keys.insert(raw_code);
             return wrap(Task::batch([
-                state.send_commit(libchinese_core::utils::to_fullwidth(&ch.to_string())),
+                state.send_commit(utils::to_fullwidth(&ch.to_string())),
                 input_method::filter_key(serial, true),
             ]));
         }
@@ -616,7 +615,7 @@ fn handle_key_press(
         let as_ime = if ch.is_ascii_lowercase() {
             Some(ImeKeyEvent::Char(ch))
         } else if state.pinyin_config.chinese_punctuation
-            && libchinese_core::preferred_chinese_punct(ch).is_some()
+            && preferred_chinese_punct(ch).is_some()
         {
             Some(ImeKeyEvent::Char(ch))
         } else {

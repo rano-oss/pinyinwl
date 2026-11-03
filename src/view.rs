@@ -50,13 +50,15 @@ pub fn view<'a>(state: &'a InputMethodState, _window: iced::window::Id) -> Eleme
         row(items).spacing(spacing.space_xxxs).into()
     };
 
+    let header = segmented_preedit(state, &colors);
     let footer = popup_footer(state, &colors);
-    let body: Element<'_, Message> = if let Some(foot) = footer {
-        widget::column![list, foot]
+    let body: Element<'_, Message> = match (header, footer) {
+        (Some(h), Some(f)) => widget::column![h, list, f]
             .spacing(spacing.space_xxs)
-            .into()
-    } else {
-        list
+            .into(),
+        (Some(h), None) => widget::column![h, list].spacing(spacing.space_xxs).into(),
+        (None, Some(f)) => widget::column![list, f].spacing(spacing.space_xxs).into(),
+        (None, None) => list,
     };
 
     cosmic::widget::autosize::autosize(
@@ -68,6 +70,33 @@ pub fn view<'a>(state: &'a InputMethodState, _window: iced::window::Id) -> Eleme
         cosmic::widget::Id::new("im-popup"),
     )
     .into()
+}
+
+fn segmented_preedit<'a>(
+    state: &'a InputMethodState,
+    colors: &CandidateColors,
+) -> Option<Element<'a, Message>> {
+    if !state.pinyin_config.show_composition_segments {
+        return None;
+    }
+    let ctx = state.ime.context();
+    if ctx.preedit_text.is_empty() {
+        return None;
+    }
+    let label = if ctx.preedit_segments.is_empty() {
+        ctx.preedit_text.clone()
+    } else {
+        ctx.preedit_segments
+            .iter()
+            .filter_map(|seg| ctx.preedit_text.get(seg.range.clone()))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    };
+    Some(
+        text::caption(label)
+            .class(cosmic::theme::style::Text::Color(colors.dim_fg))
+            .into(),
+    )
 }
 
 /// Page N/M (when enabled) + tone filter (always when active).
