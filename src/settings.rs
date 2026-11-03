@@ -980,7 +980,7 @@ fn import_user_dict() -> String {
     if data.is_empty() {
         return "Import file is empty.".into();
     }
-    let ud = match open_user_dict() {
+    let mut ud = match open_user_dict() {
         Ok(ud) => ud,
         Err(_) => {
             // Try to create it
@@ -1035,7 +1035,7 @@ fn list_masked_phrases() -> Vec<String> {
 }
 
 pub fn add_custom_phrase(phrase: &str) -> String {
-    let ud = match open_user_dict() {
+    let mut ud = match open_user_dict() {
         Ok(ud) => ud,
         Err(_) => {
             let path = user_dict_path();
@@ -1055,7 +1055,7 @@ pub fn add_custom_phrase(phrase: &str) -> String {
 }
 
 pub fn delete_custom_phrase(phrase: &str) -> String {
-    let Ok(ud) = open_user_dict() else {
+    let Ok(mut ud) = open_user_dict() else {
         return "User dictionary not found.".into();
     };
     match ud.delete_phrase(phrase) {
@@ -1068,7 +1068,7 @@ pub fn delete_custom_phrase(phrase: &str) -> String {
 }
 
 fn unmask_phrase(phrase: &str) -> String {
-    let Ok(ud) = open_user_dict() else {
+    let Ok(mut ud) = open_user_dict() else {
         return "User dictionary not found.".into();
     };
     match ud.unmask_phrase(phrase) {
@@ -1079,7 +1079,7 @@ fn unmask_phrase(phrase: &str) -> String {
 }
 
 fn clear_masked_phrases() -> String {
-    let Ok(ud) = open_user_dict() else {
+    let Ok(mut ud) = open_user_dict() else {
         return "User dictionary not found.".into();
     };
     let n = ud.list_masked().len();
