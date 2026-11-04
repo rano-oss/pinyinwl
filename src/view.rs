@@ -79,7 +79,7 @@ fn segmented_preedit<'a>(
     if !state.pinyin_config.show_composition_segments {
         return None;
     }
-    let ctx = state.ime.context();
+    let ctx = &state.editor.context;
     if ctx.preedit_text.is_empty() {
         return None;
     }
@@ -104,12 +104,11 @@ fn popup_footer<'a>(
     state: &'a InputMethodState,
     colors: &CandidateColors,
 ) -> Option<Element<'a, Message>> {
-    let page = state.ime.context().page_text.as_str();
-    let tone = state.ime.context().auxiliary_text.as_str();
+    let page = state.editor.context.page_text.as_str();
+    let tone = state.editor.context.auxiliary_text.as_str();
     let show_page = state.pinyin_config.show_page_number && !page.is_empty();
     // Tone chrome always when filter active (not gated on show_page_number).
-    let show_tone = !tone.is_empty()
-        && (tone.ends_with('声') || tone == "标点" || tone == "预测");
+    let show_tone = !tone.is_empty() && (tone.ends_with('声') || tone == "标点" || tone == "预测");
 
     if !show_page && !show_tone {
         return None;
@@ -172,13 +171,15 @@ fn candidate_item<'a>(
         let bg = colors.selected_bg;
         container(content)
             .padding(padding)
-            .class(cosmic::theme::Container::custom(move |_| container::Style {
-                background: Some(iced::Background::Color(bg)),
-                border: iced::Border {
-                    radius: corner_radius.into(),
+            .class(cosmic::theme::Container::custom(move |_| {
+                container::Style {
+                    background: Some(iced::Background::Color(bg)),
+                    border: iced::Border {
+                        radius: corner_radius.into(),
+                        ..Default::default()
+                    },
                     ..Default::default()
-                },
-                ..Default::default()
+                }
             }))
     } else {
         container(content).padding(padding)

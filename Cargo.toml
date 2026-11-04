@@ -2,7 +2,7 @@
 name = "pinyinwl"
 version = "0.1.0"
 edition = "2021"
-description = "Pinyin input method for Wayland using libchinese/libpinyin"
+description = "Pinyin input method for Wayland using libpinyin"
 
 [[bin]]
 name = "pinyinwl"
@@ -10,8 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 libcosmic = { git = "https://github.com/rano-oss/libcosmic", branch = "experimental/xx-im-preedit-start", features = ["wayland", "wayland_input_method", "winit", "wgpu"] }
-libpinyin = { path = "../libchinese/libpinyin" }
-libchinese-core = { path = "../libchinese/core" }
+libpinyin = "0.1"
 ime-control = { git = "https://github.com/rano-oss/ime-control" }
 env_logger = "0.10"
 log = "0.4"

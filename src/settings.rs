@@ -33,12 +33,14 @@ use cosmic::app::{Core, Task};
 use cosmic::iced::{self, Length};
 use cosmic::widget::{self, checkbox, container, row, settings, toggler};
 use cosmic::{executor, Element};
-use libchinese_core::UserDict;
 use libpinyin::DoublePinyinScheme;
+use libpinyin::UserDict;
 use serde::{Deserialize, Serialize};
 
 pub const CONFIG_NAME: &str = "com.pinyinwl.Settings";
 pub const CONFIG_VERSION: u64 = 1;
+/// Wayland app_id / .desktop basename — panel icon is `preferences-desktop-keyboard`.
+pub const SETTINGS_APP_ID: &str = "com.pinyinwl.Settings";
 
 const SELECT_KEY_OPTIONS: &[&str] = &["123456789", "asdfghjkl", "qwertyuio"];
 const CHARSET_LABELS: &[&str] = &["Simplified", "Traditional"];
@@ -397,11 +399,7 @@ fn double_pinyin_index(scheme: &Option<String>) -> Option<usize> {
             }
             // Migrate aliases (ibus codes / old PinYinPlusPlus name).
             DoublePinyinScheme::parse(s)
-                .and_then(|sch| {
-                    DOUBLE_PINYIN_LABELS
-                        .iter()
-                        .position(|v| *v == sch.as_str())
-                })
+                .and_then(|sch| DOUBLE_PINYIN_LABELS.iter().position(|v| *v == sch.as_str()))
                 .or(Some(0))
         }
     }
@@ -412,7 +410,7 @@ impl cosmic::Application for SettingsApp {
     type Flags = ();
     type Message = Msg;
 
-    const APP_ID: &'static str = "com.pinyinwl.Settings";
+    const APP_ID: &'static str = SETTINGS_APP_ID;
 
     fn core(&self) -> &Core {
         &self.core
@@ -434,7 +432,13 @@ impl cosmic::Application for SettingsApp {
     }
 
     fn header_start(&self) -> Vec<Element<'_, Self::Message>> {
-        vec![widget::text::title3("Pinyin Settings").into()]
+        // Win/Mac IME prefs use a keyboard/settings metaphor (not a generic app mark).
+        vec![
+            widget::icon::from_name("preferences-desktop-keyboard")
+                .size(24)
+                .into(),
+            widget::text::title3("Pinyin Settings").into(),
+        ]
     }
 
     fn update(&mut self, msg: Self::Message) -> Task<Self::Message> {
@@ -681,8 +685,7 @@ fn build_settings_view(
         ))
         .add(settings::item(
             "Show syllable segments above candidates (wo · de)",
-            toggler(config.show_composition_segments)
-                .on_toggle(Msg::ToggleShowCompositionSegments),
+            toggler(config.show_composition_segments).on_toggle(Msg::ToggleShowCompositionSegments),
         ))
         .add(settings::item(
             "Select candidate with ↑/↓ (Tab = tone filter while composing)",
@@ -847,8 +850,7 @@ fn build_settings_view(
         let p = phrase.clone();
         custom_section = custom_section.add(settings::item(
             format!("{phrase} ({freq})"),
-            widget::button::destructive("Delete")
-                .on_press(Msg::DeleteCustomPhrase(p)),
+            widget::button::destructive("Delete").on_press(Msg::DeleteCustomPhrase(p)),
         ));
     }
     let custom_section: Element<'static, Msg> = custom_section.into();
@@ -856,10 +858,8 @@ fn build_settings_view(
     // === Masked phrases ===
     let masked = list_masked_phrases();
     let mut masked_section = settings::section().title("Masked Phrases").add(
-        row![
-            widget::button::destructive("Clear All Masks").on_press(Msg::ClearMaskedPhrases),
-        ]
-        .spacing(8),
+        row![widget::button::destructive("Clear All Masks").on_press(Msg::ClearMaskedPhrases),]
+            .spacing(8),
     );
     if masked.is_empty() {
         masked_section =

@@ -2,10 +2,10 @@
 
 use std::collections::HashSet;
 
-use libchinese_core::{
-    CandidateRankMode, ImeEngine, InputPurpose, KeyEvent as ImeKeyEvent, Lexicon, WordBigram,
+use libpinyin::{
+    CandidateRankMode, Editor, EditorOptions, Engine, InputPurpose, KeyEvent as ImeKeyEvent, Lexicon,
+    WordBigram,
 };
-use libpinyin::{Engine, Parser};
 
 use cosmic::iced::platform_specific::shell::wayland::commands::input_method::{
     self, PopupPositionMode,
@@ -18,8 +18,6 @@ use crate::Message;
 
 /// Default data directory for libpinyin model files
 const DATA_DIR: &str = "/usr/share/libpinyin/data";
-
-
 
 /// StartOfPreedit probe: caret-at-0 commit, then real caret after IM `Done`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -37,7 +35,7 @@ pub enum AnchorPhase {
 }
 
 pub struct InputMethodState {
-    pub ime: ImeEngine<Parser>,
+    pub editor: Editor,
     pub pinyin_config: PinyinConfig,
     /// Pending 中/英 toggle on Shift release (cleared if another key is pressed).
     pub shift_set: bool,
@@ -59,56 +57,13 @@ impl InputMethodState {
             log::error!("If the error is 'Database already open', another pinyinwl holds ~/.pinyin/userdict.redb — set LIBCHINESE_USERDICT (or PINYINWL_DATA_DIR, which now uses <data_dir>/userdict.redb)");
             std::process::exit(1);
         });
-        // Reinforce Best UX (also the libchinese defaults) + user toggles.
-        engine.set_emit_composed_sentences(true);
-        engine.set_candidate_rank_mode(CandidateRankMode::MatchedSpanThenScore);
-        engine.set_emoji_enabled(pinyin_config.emoji_candidate);
-        engine.set_english_enabled(pinyin_config.english_candidate);
-        engine.set_sort_by_pinyin_length(pinyin_config.sort_by_pinyin_length);
-        engine.set_double_pinyin_scheme(pinyin_config.double_pinyin_scheme.clone());
-        engine.set_allow_fuzzy(
-            pinyin_config.fuzzy_pinyin
-                || pinyin_config.pinyin_incomplete
-                || pinyin_config.correct_pinyin,
-        );
-        {
-            let mut cfg = engine.config_mut();
-            cfg.fuzzy = build_fuzzy_rules(&pinyin_config);
-            cfg.auto_suggestion = pinyin_config.auto_suggestion;
-            cfg.min_suggestion_trigger_length = if pinyin_config.auto_suggestion {
-                1
-            } else {
-                2
-            };
-            cfg.learning_enabled = pinyin_config.learning_enabled;
-            cfg.chinese_punctuation = pinyin_config.chinese_punctuation;
-            cfg.v_mode_enabled = pinyin_config.v_mode_enabled;
-            cfg.u_mode_enabled = pinyin_config.u_mode_enabled;
-            cfg.inline_prediction = pinyin_config.inline_prediction;
-            cfg.select_keys = pinyin_config.select_keys.clone();
-            cfg.incomplete_penalty = if pinyin_config.pinyin_incomplete {
-                500
-            } else {
-                i32::MAX / 4
-            };
-            cfg.show_raw_double_pinyin = pinyin_config.show_raw_double_pinyin;
-            cfg.choose_char_from_phrase = pinyin_config.choose_char_from_phrase;
-        }
         for addon_name in &pinyin_config.enabled_addons {
             engine.set_addon_enabled(addon_name, true);
         }
-        let mut ime = ImeEngine::with_page_size(
-            engine.into_inner(),
-            pinyin_config.candidates_per_page,
-        );
-        if pinyin_config.default_fullwidth {
-            ime.set_fullwidth(true);
-        }
-        if pinyin_config.select_keys != "123456789" {
-            ime.set_select_keys(&pinyin_config.select_keys);
-        }
+        let mut editor = Editor::new(engine);
+        editor.set_editor_options(editor_options_from_config(&pinyin_config, false));
         Self {
-            ime,
+            editor,
             pinyin_config,
             shift_set: false,
             shift_held: false,
@@ -118,10 +73,11 @@ impl InputMethodState {
         }
     }
 
+    /// Panel label: 英 / 全 / 繁 / 中 (passthrough → fullwidth → traditional → simplified).
     pub fn mode_status_text(&self) -> &str {
-        if self.ime.is_passthrough() {
+        if self.editor.is_passthrough() {
             "英"
-        } else if self.ime.is_fullwidth() {
+        } else if self.editor.engine.model.config.full_width_enabled {
             "全"
         } else if self.pinyin_config.character_set == CharacterSet::Traditional {
             "繁"
@@ -131,9 +87,12 @@ impl InputMethodState {
     }
 
     pub fn publish_mode_status(&self) {
-        let english = self.ime.is_passthrough();
+        let english = self.editor.is_passthrough();
         ime_control::publish_mode_label(self.mode_status_text());
-        ime_control::publish_menu(dbus::menu_for_state(english, self.pinyin_config.character_set));
+        ime_control::publish_menu(dbus::menu_for_state(
+            english,
+            self.pinyin_config.character_set,
+        ));
     }
 
     pub fn reload_config(&mut self) {
@@ -153,7 +112,7 @@ impl InputMethodState {
 
     /// Switch 中/英 (ibus-libpinyin-style).
     pub fn set_english_mode(&mut self, english: bool) -> Task<Message> {
-        if english == self.ime.is_passthrough() {
+        if english == self.editor.is_passthrough() {
             self.publish_mode_status();
             return Task::none();
         }
@@ -178,7 +137,7 @@ impl InputMethodState {
             None
         };
 
-        self.ime.set_passthrough(english);
+        self.editor.set_passthrough(english);
         self.publish_mode_status();
 
         commit.unwrap_or_else(Task::none)
@@ -201,7 +160,7 @@ impl InputMethodState {
             let data_dir = resolve_data_dir(self.pinyin_config.character_set);
             let dir = std::path::Path::new(&data_dir);
             match Lexicon::load(&dir.join("lexicon.fst"), &dir.join("lexicon.dat")) {
-                Ok(lex) => self.ime.backend_mut().swap_lexicon(lex),
+                Ok(lex) => self.editor.engine.swap_lexicon(lex),
                 Err(e) => log::error!(
                     "Failed to load {:?} lexicon: {}",
                     self.pinyin_config.character_set,
@@ -212,7 +171,7 @@ impl InputMethodState {
                 &dir.join("word_bigram.dat"),
                 &dir.join("word_bigram_words.fst"),
             ) {
-                Ok(wb) => self.ime.backend_mut().swap_word_bigram(wb),
+                Ok(wb) => self.editor.engine.swap_word_bigram(wb),
                 Err(e) => log::error!(
                     "Failed to load {:?} word_bigram: {}",
                     self.pinyin_config.character_set,
@@ -222,52 +181,18 @@ impl InputMethodState {
         }
 
         let c = &self.pinyin_config;
-        self.ime.set_page_size(c.candidates_per_page);
-        self.ime.set_select_keys(&c.select_keys);
-        self.ime.set_fullwidth(c.default_fullwidth);
-        {
-            let mut cfg = self.ime.backend_mut().config_mut();
-            cfg.select_keys = c.select_keys.clone();
-            cfg.auto_suggestion = c.auto_suggestion;
-            cfg.learning_enabled = c.learning_enabled;
-            cfg.chinese_punctuation = c.chinese_punctuation;
-            cfg.v_mode_enabled = c.v_mode_enabled;
-            cfg.u_mode_enabled = c.u_mode_enabled;
-            cfg.inline_prediction = c.inline_prediction;
-            cfg.show_raw_double_pinyin = c.show_raw_double_pinyin;
-            cfg.fuzzy = build_fuzzy_rules(c);
-            cfg.incomplete_penalty = if c.pinyin_incomplete {
-                500
-            } else {
-                i32::MAX / 4
-            };
-            cfg.choose_char_from_phrase = c.choose_char_from_phrase;
-            cfg.min_suggestion_trigger_length = if c.auto_suggestion { 1 } else { 2 };
-        }
-        self.ime.backend_mut().set_emit_composed_sentences(true);
-        self.ime
-            .backend_mut()
-            .set_candidate_rank_mode(CandidateRankMode::MatchedSpanThenScore);
-        self.ime.backend_mut().set_emoji_enabled(c.emoji_candidate);
-        self.ime.backend_mut().set_english_enabled(c.english_candidate);
-        self.ime
-            .backend_mut()
-            .set_sort_by_pinyin_length(c.sort_by_pinyin_length);
-        self.ime
-            .backend_mut()
-            .set_double_pinyin_scheme(c.double_pinyin_scheme.clone());
-        self.ime.backend_mut().set_allow_fuzzy(
-            c.fuzzy_pinyin || c.pinyin_incomplete || c.correct_pinyin,
-        );
+        let mut opts = editor_options_from_config(c, self.editor.is_passthrough());
+        opts.input_purpose = self.editor.context.input_purpose;
+        self.editor.set_editor_options(opts);
 
         for addon in &old_addons {
             if !c.enabled_addons.contains(addon) {
-                self.ime.backend_mut().set_addon_enabled(addon, false);
+                self.editor.engine.set_addon_enabled(addon, false);
             }
         }
         for addon in &c.enabled_addons {
             if !old_addons.contains(addon) {
-                self.ime.backend_mut().set_addon_enabled(addon, true);
+                self.editor.engine.set_addon_enabled(addon, true);
             }
         }
     }
@@ -286,7 +211,7 @@ impl InputMethodState {
     }
 
     pub fn set_input_purpose(&mut self, purpose: InputPurpose) {
-        self.ime.set_input_purpose(purpose);
+        self.editor.set_input_purpose(purpose);
     }
 
     pub fn set_content_type(&mut self, hint: u32, purpose: u32) {
@@ -311,15 +236,15 @@ impl InputMethodState {
     }
 
     pub fn preedit(&self) -> &str {
-        &self.ime.context().preedit_text
+        &self.editor.context.preedit_text
     }
 
     pub fn candidates(&self) -> &[String] {
-        &self.ime.context().candidates
+        &self.editor.context.candidates
     }
 
     pub fn candidate_cursor(&self) -> usize {
-        self.ime.context().candidate_cursor
+        self.editor.context.candidate_cursor
     }
 
     pub fn selection_keys(&self) -> &str {
@@ -328,7 +253,7 @@ impl InputMethodState {
 
     fn cursor_byte_position(&self) -> i32 {
         let preedit = self.preedit();
-        let mut c = self.ime.context().preedit_cursor.min(preedit.len());
+        let mut c = self.editor.context.preedit_cursor.min(preedit.len());
         while c > 0 && !preedit.is_char_boundary(c) {
             c -= 1;
         }
@@ -336,7 +261,7 @@ impl InputMethodState {
     }
 
     fn take_commit(&mut self) -> Option<String> {
-        let ctx = self.ime.context_mut();
+        let ctx = &mut self.editor.context;
         if ctx.has_commit() {
             Some(ctx.take_commit())
         } else {
@@ -427,13 +352,13 @@ impl InputMethodState {
             )
             && self.candidates().len() == 1
             && !self.preedit().is_empty()
-            && !self.ime.context().has_commit()
+            && !self.editor.context.has_commit()
         {
-            let _ = self.ime.process_key(ImeKeyEvent::Number(1));
+            let _ = self.editor.process_key(ImeKeyEvent::Number(1));
         }
 
         if let Some(text) = self.take_commit() {
-            self.ime.backend_mut().commit(&text);
+            self.editor.engine.commit(&text);
             let preedit = self.preedit().to_owned();
             if preedit.is_empty() {
                 self.anchor_phase = AnchorPhase::Idle;
@@ -464,9 +389,7 @@ impl InputMethodState {
             self.start_preedit_anchor(preedit)
         } else if matches!(
             self.anchor_phase,
-            AnchorPhase::Probing
-                | AnchorPhase::ReanchorPending
-                | AnchorPhase::ReanchorProbing
+            AnchorPhase::Probing | AnchorPhase::ReanchorPending | AnchorPhase::ReanchorProbing
         ) {
             Task::none()
         } else {
@@ -534,7 +457,7 @@ pub fn resolve_data_dir(character_set: CharacterSet) -> String {
                 std::env::var("HOME").unwrap_or_default(),
                 suffix
             ),
-            format!("../libchinese/data/converted/{}", suffix),
+            format!("../libpinyin/data/converted/{}", suffix),
         ];
         for path in &candidates {
             if std::path::Path::new(path).join("lexicon.fst").exists() {
@@ -543,6 +466,43 @@ pub fn resolve_data_dir(character_set: CharacterSet) -> String {
         }
         DATA_DIR.to_string()
     })
+}
+
+/// Map settings to a full [`EditorOptions`] blob (Best UX ranking).
+pub fn editor_options_from_config(c: &PinyinConfig, passthrough: bool) -> EditorOptions {
+    EditorOptions {
+        candidates_per_page: c.candidates_per_page,
+        select_keys: if c.select_keys.is_empty() {
+            "123456789".to_string()
+        } else {
+            c.select_keys.clone()
+        },
+        full_width: c.default_fullwidth,
+        passthrough,
+        chinese_punctuation: c.chinese_punctuation,
+        auto_suggestion: c.auto_suggestion,
+        min_suggestion_trigger_length: if c.auto_suggestion { 1 } else { 2 },
+        learning_enabled: c.learning_enabled,
+        v_mode_enabled: c.v_mode_enabled,
+        u_mode_enabled: c.u_mode_enabled,
+        inline_prediction: c.inline_prediction,
+        show_raw_double_pinyin: c.show_raw_double_pinyin,
+        choose_char_from_phrase: c.choose_char_from_phrase,
+        emoji_enabled: c.emoji_candidate,
+        english_enabled: c.english_candidate,
+        allow_fuzzy: c.fuzzy_pinyin || c.pinyin_incomplete || c.correct_pinyin,
+        sort_by_pinyin_length: c.sort_by_pinyin_length,
+        double_pinyin_scheme: c.double_pinyin_scheme.clone(),
+        emit_composed_sentences: true,
+        candidate_rank_mode: CandidateRankMode::MatchedSpanThenScore,
+        fuzzy: build_fuzzy_rules(c),
+        incomplete_penalty: if c.pinyin_incomplete {
+            500
+        } else {
+            i32::MAX / 4
+        },
+        ..EditorOptions::default()
+    }
 }
 
 pub fn build_fuzzy_rules(config: &PinyinConfig) -> Vec<String> {
