@@ -33,10 +33,14 @@ use cosmic::app::{Core, Task};
 use cosmic::iced::{self, Length};
 use cosmic::widget::{self, checkbox, container, row, settings, toggler};
 use cosmic::{executor, Element};
+use libpinyin::double_pinyin::DoublePinyinScheme;
+use libpinyin::userdict::UserDict;
 use serde::{Deserialize, Serialize};
 
 pub const CONFIG_NAME: &str = "com.pinyinwl.Settings";
 pub const CONFIG_VERSION: u64 = 1;
+/// Wayland app_id / .desktop basename — panel icon is `preferences-desktop-keyboard`.
+pub const SETTINGS_APP_ID: &str = "com.pinyinwl.Settings";
 
 const SELECT_KEY_OPTIONS: &[&str] = &["123456789", "asdfghjkl", "qwertyuio"];
 const CHARSET_LABELS: &[&str] = &["Simplified", "Traditional"];
@@ -50,12 +54,6 @@ const DOUBLE_PINYIN_LABELS: &[&str] = &[
     "PinyinJiaJia",
     "XiaoHe",
 ];
-const IME_PROFILE_LABELS: &[&str] = &["Best UX", "libpinyin compat"];
-const IME_PROFILE_VALUES: &[libpinyin::ImeProfile] = &[
-    libpinyin::ImeProfile::BestUx,
-    libpinyin::ImeProfile::LibpinyinCompat,
-];
-
 /// Available addon dictionary names (shipped with the data package).
 const AVAILABLE_ADDONS: &[&str] = &[
     "art",
@@ -73,16 +71,11 @@ const AVAILABLE_ADDONS: &[&str] = &[
 ];
 
 /// Character set for candidate generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum CharacterSet {
+    #[default]
     Simplified,
     Traditional,
-}
-
-impl Default for CharacterSet {
-    fn default() -> Self {
-        Self::Simplified
-    }
 }
 
 /// Pinyin settings stored in cosmic-config
@@ -95,9 +88,6 @@ pub struct PinyinConfig {
     pub select_keys: String,
 
     // -- Pinyin behavior --
-    /// Best UX (default) vs closer C/C++ libpinyin candidate-bar behaviour.
-    #[serde(default)]
-    pub ime_profile: libpinyin::ImeProfile,
     pub pinyin_incomplete: bool,
     pub sort_by_pinyin_length: bool,
     pub auto_suggestion: bool,
@@ -124,6 +114,8 @@ pub struct PinyinConfig {
     // -- Candidate UI / navigation (chewingwl parity) --
     #[serde(default = "default_true")]
     pub show_page_number: bool,
+    #[serde(default)]
+    pub show_composition_segments: bool,
     #[serde(default = "default_true")]
     pub vertical_lookup_table: bool,
     #[serde(default = "default_true")]
@@ -214,7 +206,6 @@ impl Default for PinyinConfig {
             auto_commit_single: false,
             select_keys: "123456789".to_string(),
 
-            ime_profile: libpinyin::ImeProfile::BestUx,
             pinyin_incomplete: true,
             sort_by_pinyin_length: false,
             auto_suggestion: true,
@@ -228,6 +219,7 @@ impl Default for PinyinConfig {
             character_set: CharacterSet::Simplified,
 
             show_page_number: true,
+            show_composition_segments: false,
             vertical_lookup_table: true,
             select_candidate_with_arrow_key: true,
             use_keypad_as_selection_key: false,
@@ -319,7 +311,6 @@ pub enum Msg {
     SetSelectKeys(String),
     SetCandidatesPerPage(usize),
     // Behavior
-    SetImeProfile(libpinyin::ImeProfile),
     TogglePinyinIncomplete(bool),
     ToggleSortByPinyinLength(bool),
     ToggleAutoSuggestion(bool),
@@ -329,13 +320,16 @@ pub enum Msg {
     ToggleUMode(bool),
     ToggleInlinePrediction(bool),
     ToggleEmojiCandidate(bool),
-    // Custom phrases
+    // Custom phrases / userdict filter
     CustomPhraseInput(String),
     AddCustomPhrase,
     DeleteCustomPhrase(String),
+    UnmaskPhrase(String),
+    ClearMaskedPhrases,
     ToggleEnglishCandidate(bool),
     SetCharacterSet(CharacterSet),
     ToggleShowPageNumber(bool),
+    ToggleShowCompositionSegments(bool),
     ToggleVerticalLookupTable(bool),
     ToggleSelectWithArrowKey(bool),
     ToggleKeypadAsSelection(bool),
@@ -399,12 +393,8 @@ fn double_pinyin_index(scheme: &Option<String>) -> Option<usize> {
                 return Some(i);
             }
             // Migrate aliases (ibus codes / old PinYinPlusPlus name).
-            libpinyin::DoublePinyinScheme::parse(s)
-                .and_then(|sch| {
-                    DOUBLE_PINYIN_LABELS
-                        .iter()
-                        .position(|v| *v == sch.as_str())
-                })
+            DoublePinyinScheme::parse(s)
+                .and_then(|sch| DOUBLE_PINYIN_LABELS.iter().position(|v| *v == sch.as_str()))
                 .or(Some(0))
         }
     }
@@ -415,7 +405,7 @@ impl cosmic::Application for SettingsApp {
     type Flags = ();
     type Message = Msg;
 
-    const APP_ID: &'static str = "com.pinyinwl.Settings";
+    const APP_ID: &'static str = SETTINGS_APP_ID;
 
     fn core(&self) -> &Core {
         &self.core
@@ -437,7 +427,13 @@ impl cosmic::Application for SettingsApp {
     }
 
     fn header_start(&self) -> Vec<Element<'_, Self::Message>> {
-        vec![widget::text::title3("Pinyin Settings").into()]
+        // Win/Mac IME prefs use a keyboard/settings metaphor (not a generic app mark).
+        vec![
+            widget::icon::from_name("preferences-desktop-keyboard")
+                .size(24)
+                .into(),
+            widget::text::title3("Pinyin Settings").into(),
+        ]
     }
 
     fn update(&mut self, msg: Self::Message) -> Task<Self::Message> {
@@ -458,6 +454,14 @@ impl cosmic::Application for SettingsApp {
             }
             Msg::DeleteCustomPhrase(p) => {
                 self.status_message = Some(delete_custom_phrase(p));
+                return Task::none();
+            }
+            Msg::UnmaskPhrase(p) => {
+                self.status_message = Some(unmask_phrase(p));
+                return Task::none();
+            }
+            Msg::ClearMaskedPhrases => {
+                self.status_message = Some(clear_masked_phrases());
                 return Task::none();
             }
             _ => {}
@@ -485,27 +489,6 @@ pub fn apply_msg(config: &mut PinyinConfig, msg: Msg) -> Option<String> {
         Msg::ToggleAutoCommitSingle(v) => config.auto_commit_single = v,
         Msg::SetSelectKeys(k) => config.select_keys = k,
         Msg::SetCandidatesPerPage(n) => config.candidates_per_page = n,
-        Msg::SetImeProfile(p) => {
-            config.ime_profile = p;
-            // Sync related toggles to the profile defaults; user can still change them after.
-            match p {
-                libpinyin::ImeProfile::BestUx => {
-                    config.auto_suggestion = true;
-                    config.learning_enabled = true;
-                    config.chinese_punctuation = true;
-                    config.v_mode_enabled = true;
-                    config.u_mode_enabled = true;
-                    config.inline_prediction = true;
-                    config.emoji_candidate = true;
-                    config.english_candidate = true;
-                }
-                libpinyin::ImeProfile::LibpinyinCompat => {
-                    config.auto_suggestion = false;
-                    config.emoji_candidate = false;
-                    config.english_candidate = false;
-                }
-            }
-        }
         Msg::TogglePinyinIncomplete(v) => config.pinyin_incomplete = v,
         Msg::ToggleSortByPinyinLength(v) => config.sort_by_pinyin_length = v,
         Msg::ToggleAutoSuggestion(v) => config.auto_suggestion = v,
@@ -515,12 +498,17 @@ pub fn apply_msg(config: &mut PinyinConfig, msg: Msg) -> Option<String> {
         Msg::ToggleUMode(v) => config.u_mode_enabled = v,
         Msg::ToggleInlinePrediction(v) => config.inline_prediction = v,
         Msg::ToggleEmojiCandidate(v) => config.emoji_candidate = v,
-        Msg::CustomPhraseInput(_) | Msg::AddCustomPhrase | Msg::DeleteCustomPhrase(_) => {
+        Msg::CustomPhraseInput(_)
+        | Msg::AddCustomPhrase
+        | Msg::DeleteCustomPhrase(_)
+        | Msg::UnmaskPhrase(_)
+        | Msg::ClearMaskedPhrases => {
             // Handled in SettingsApp with live userdict access.
         }
         Msg::ToggleEnglishCandidate(v) => config.english_candidate = v,
         Msg::SetCharacterSet(cs) => config.character_set = cs,
         Msg::ToggleShowPageNumber(v) => config.show_page_number = v,
+        Msg::ToggleShowCompositionSegments(v) => config.show_composition_segments = v,
         Msg::ToggleVerticalLookupTable(v) => config.vertical_lookup_table = v,
         Msg::ToggleSelectWithArrowKey(v) => config.select_candidate_with_arrow_key = v,
         Msg::ToggleKeypadAsSelection(v) => config.use_keypad_as_selection_key = v,
@@ -635,16 +623,6 @@ fn build_settings_view(
             }),
         ))
         .add(settings::item(
-            "IME profile",
-            widget::dropdown(
-                IME_PROFILE_LABELS,
-                IME_PROFILE_VALUES
-                    .iter()
-                    .position(|p| *p == config.ime_profile),
-                |i| Msg::SetImeProfile(IME_PROFILE_VALUES[i]),
-            ),
-        ))
-        .add(settings::item(
             "Fullwidth ASCII (Shift+Space toggles while typing)",
             toggler(config.default_fullwidth).on_toggle(Msg::ToggleDefaultFullwidth),
         ))
@@ -699,6 +677,10 @@ fn build_settings_view(
         .add(settings::item(
             "Show page number (N/M under candidates)",
             toggler(config.show_page_number).on_toggle(Msg::ToggleShowPageNumber),
+        ))
+        .add(settings::item(
+            "Show syllable segments above candidates (wo · de)",
+            toggler(config.show_composition_segments).on_toggle(Msg::ToggleShowCompositionSegments),
         ))
         .add(settings::item(
             "Select candidate with ↑/↓ (Tab = tone filter while composing)",
@@ -770,7 +752,8 @@ fn build_settings_view(
             toggler(config.fuzzy_pinyin).on_toggle(Msg::ToggleFuzzyPinyin),
         ));
 
-    let fuzzy_rules: &[(&str, bool, fn(bool) -> Msg)] = &[
+    type ToggleRule = (&'static str, bool, fn(bool) -> Msg);
+    let fuzzy_rules: &[ToggleRule] = &[
         ("zh <=> z", config.fuzzy_zh_z, Msg::ToggleFuzzyZhZ),
         ("ch <=> c", config.fuzzy_ch_c, Msg::ToggleFuzzyChC),
         ("sh <=> s", config.fuzzy_sh_s, Msg::ToggleFuzzyShS),
@@ -809,7 +792,7 @@ fn build_settings_view(
         toggler(config.correct_pinyin).on_toggle(Msg::ToggleCorrectPinyin),
     ));
 
-    let correction_rules: &[(&str, bool, fn(bool) -> Msg)] = &[
+    let correction_rules: &[ToggleRule] = &[
         ("gn => ng", config.correct_gn_ng, Msg::ToggleCorrectGnNg),
         ("mg => ng", config.correct_mg_ng, Msg::ToggleCorrectMgNg),
         ("iou => iu", config.correct_iou_iu, Msg::ToggleCorrectIouIu),
@@ -850,24 +833,43 @@ fn build_settings_view(
     let mut custom_section = settings::section()
         .title("Custom Phrases")
         .add(settings::item(
-            "New phrase",
+            "Add / filter",
             row![
-                widget::text_input("例如：你好世界", draft)
+                widget::text_input("例如：你好", draft)
                     .on_input(Msg::CustomPhraseInput)
-                    .width(Length::Fixed(200.0)),
+                    .width(Length::Fixed(220.0)),
                 widget::button::suggested("Add").on_press(Msg::AddCustomPhrase),
             ]
             .spacing(8),
         ));
-    for (phrase, freq) in list_custom_phrases().into_iter().take(20) {
+    for (phrase, freq) in list_custom_phrases(phrase_draft).into_iter().take(20) {
         let p = phrase.clone();
         custom_section = custom_section.add(settings::item(
             format!("{phrase} ({freq})"),
-            widget::button::destructive("Delete")
-                .on_press(Msg::DeleteCustomPhrase(p)),
+            widget::button::destructive("Delete").on_press(Msg::DeleteCustomPhrase(p)),
         ));
     }
     let custom_section: Element<'static, Msg> = custom_section.into();
+
+    // === Masked phrases ===
+    let masked = list_masked_phrases();
+    let mut masked_section = settings::section().title("Masked Phrases").add(
+        row![widget::button::destructive("Clear All Masks").on_press(Msg::ClearMaskedPhrases),]
+            .spacing(8),
+    );
+    if masked.is_empty() {
+        masked_section =
+            masked_section.add(widget::text::caption("No masked phrases.".to_string()));
+    } else {
+        for phrase in masked.into_iter().take(30) {
+            let p = phrase.clone();
+            masked_section = masked_section.add(settings::item(
+                phrase,
+                widget::button::standard("Unmask").on_press(Msg::UnmaskPhrase(p)),
+            ));
+        }
+    }
+    let masked_section: Element<'static, Msg> = masked_section.into();
 
     // === User Dictionary section ===
     let mut user_dict_section = settings::section().title("User Dictionary").add(
@@ -891,6 +893,7 @@ fn build_settings_view(
         corrections_section,
         addon_section,
         custom_section,
+        masked_section,
         user_dict_section,
     ])
     .padding(20)
@@ -926,12 +929,12 @@ fn user_dict_export_path() -> PathBuf {
     user_dict_dir().join("user_dict_export.ron")
 }
 
-fn open_user_dict() -> Result<libchinese_core::UserDict, String> {
+fn open_user_dict() -> Result<UserDict, String> {
     let path = user_dict_path();
     if !path.exists() {
         return Err("User dictionary not found. Start typing to create one.".into());
     }
-    libchinese_core::UserDict::new(&path).map_err(|e| format!("Failed to open user dict: {}", e))
+    UserDict::new(&path).map_err(|e| format!("Failed to open user dict: {}", e))
 }
 
 fn export_user_dict() -> String {
@@ -973,7 +976,7 @@ fn import_user_dict() -> String {
     if data.is_empty() {
         return "Import file is empty.".into();
     }
-    let ud = match open_user_dict() {
+    let mut ud = match open_user_dict() {
         Ok(ud) => ud,
         Err(_) => {
             // Try to create it
@@ -981,7 +984,7 @@ fn import_user_dict() -> String {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            match libchinese_core::UserDict::new(&path) {
+            match UserDict::new(&path) {
                 Ok(ud) => ud,
                 Err(e) => return format!("Failed to create user dict: {}", e),
             }
@@ -1007,24 +1010,35 @@ fn clear_user_dict() -> String {
     }
 }
 
-fn list_custom_phrases() -> Vec<(String, u64)> {
+fn list_custom_phrases(prefix: &str) -> Vec<(String, u64)> {
     let Ok(ud) = open_user_dict() else {
         return Vec::new();
     };
-    let mut all = ud.list_all();
+    let mut all = if prefix.trim().is_empty() {
+        ud.list_all()
+    } else {
+        ud.search_by_prefix(prefix.trim()).unwrap_or_default()
+    };
     all.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     all
 }
 
+fn list_masked_phrases() -> Vec<String> {
+    let Ok(ud) = open_user_dict() else {
+        return Vec::new();
+    };
+    ud.list_masked()
+}
+
 pub fn add_custom_phrase(phrase: &str) -> String {
-    let ud = match open_user_dict() {
+    let mut ud = match open_user_dict() {
         Ok(ud) => ud,
         Err(_) => {
             let path = user_dict_path();
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            match libchinese_core::UserDict::new(&path) {
+            match UserDict::new(&path) {
                 Ok(ud) => ud,
                 Err(e) => return format!("Failed to open user dict: {e}"),
             }
@@ -1037,7 +1051,7 @@ pub fn add_custom_phrase(phrase: &str) -> String {
 }
 
 pub fn delete_custom_phrase(phrase: &str) -> String {
-    let Ok(ud) = open_user_dict() else {
+    let Ok(mut ud) = open_user_dict() else {
         return "User dictionary not found.".into();
     };
     match ud.delete_phrase(phrase) {
@@ -1046,5 +1060,27 @@ pub fn delete_custom_phrase(phrase: &str) -> String {
             format!("Deleted “{phrase}”")
         }
         Err(e) => format!("Failed to delete: {e}"),
+    }
+}
+
+fn unmask_phrase(phrase: &str) -> String {
+    let Ok(mut ud) = open_user_dict() else {
+        return "User dictionary not found.".into();
+    };
+    match ud.unmask_phrase(phrase) {
+        Ok(true) => format!("Unmasked “{phrase}”"),
+        Ok(false) => format!("“{phrase}” was not masked"),
+        Err(e) => format!("Failed to unmask: {e}"),
+    }
+}
+
+fn clear_masked_phrases() -> String {
+    let Ok(mut ud) = open_user_dict() else {
+        return "User dictionary not found.".into();
+    };
+    let n = ud.list_masked().len();
+    match ud.clear_masked() {
+        Ok(()) => format!("Cleared {n} masked phrase(s)"),
+        Err(e) => format!("Failed to clear masks: {e}"),
     }
 }

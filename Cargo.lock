@@ -2445,6 +2445,7 @@ checksum = "edcd27d72f2f071c64249075f42e205ff93c9a4c5f6c6da53e79ed9f9832c285"
 [[package]]
 name = "ime-control"
 version = "0.1.0"
+source = "git+https://github.com/rano-oss/ime-control#7942c4f0bcf17f219cc029c13c7378f43aa94d0d"
 dependencies = [
  "log",
  "serde",
@@ -2744,18 +2745,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
 
 [[package]]
-name = "libchinese-core"
-version = "0.1.0"
-source = "git+https://github.com/rano-oss/libchinese?branch=main#b422f346d94192d9562f8b2b53a38831c583e053"
-dependencies = [
- "fst",
- "lru",
- "memmap2 0.9.11",
- "redb",
- "serde",
-]
-
-[[package]]
 name = "libcosmic"
 version = "1.0.0"
 source = "git+https://github.com/rano-oss/libcosmic?branch=experimental%2Fxx-im-preedit-start#54971ad165db4eb0d22bdeb704b7926a522981a3"
@@ -2823,11 +2812,15 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libpinyin"
-version = "0.1.0"
-source = "git+https://github.com/rano-oss/libchinese?branch=main#b422f346d94192d9562f8b2b53a38831c583e053"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dff354b5dddf86e77af5f05b7b0b786c2093ba40aec5175bfcd122b6db54e33"
 dependencies = [
- "libchinese-core",
+ "fst",
  "log",
+ "lru",
+ "memmap2 0.9.11",
+ "redb",
  "serde",
 ]
 
@@ -3652,7 +3645,6 @@ dependencies = [
  "env_logger",
  "ime-control",
  "libc",
- "libchinese-core",
  "libcosmic",
  "libpinyin",
  "log",

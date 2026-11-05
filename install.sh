@@ -7,10 +7,9 @@
 #   ./install.sh install  # Install only (assumes already built)
 #
 # Installs:
-#   - pinyinwl binary (IME daemon)
-#   - cosmic-applet-pinyin binary (panel applet)
-#   - Lexicon data (simplified, traditional, emoji, english wordlist, addons)
-#   - Desktop file for the applet
+#   - pinyinwl binary (IME daemon; depends on crates.io libpinyin)
+#   - Lexicon data from a sibling libpinyin checkout (data/converted/)
+#   - Desktop file for settings (panel icon: preferences-desktop-keyboard)
 
 set -e
 
@@ -20,7 +19,7 @@ DATADIR="${DATADIR:-$PREFIX/share/libpinyin/data}"
 APPDIR="${APPDIR:-$PREFIX/share/applications}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-LIBCHINESE_DIR="${LIBCHINESE_DIR:-$SCRIPT_DIR/../libchinese}"
+LIBPINYIN_DIR="${LIBPINYIN_DIR:-$SCRIPT_DIR/../libpinyin}"
 PROFILE="${PROFILE:-release}"
 
 # Colors
@@ -54,17 +53,12 @@ find_cargo() {
 do_build() {
     find_cargo
 
-    info "Building pinyinwl (${PROFILE})..."
+    info "Building pinyinwl (${PROFILE}) against crates.io libpinyin..."
     cargo build --profile "$PROFILE" --manifest-path "$SCRIPT_DIR/Cargo.toml"
 
-    CONVERTED_DIR="$LIBCHINESE_DIR/data/converted"
-    info "Building lexicon data (simplified + traditional hybrid)..."
-    (cd "$LIBCHINESE_DIR" && cargo run --manifest-path tools/convert_table/Cargo.toml --release)
-    info "Building word bigrams..."
-    (cd "$LIBCHINESE_DIR" && cargo run --manifest-path tools/gen_word_bigrams/Cargo.toml --release -- \
-        data/interpolation2.text data/converted/simplified)
-    (cd "$LIBCHINESE_DIR" && cargo run --manifest-path tools/gen_word_bigrams/Cargo.toml --release -- \
-        data/zhuyin/interpolation2.text data/converted/traditional)
+    local CONVERTED_DIR="$LIBPINYIN_DIR/data/converted"
+    [ -d "$CONVERTED_DIR/simplified" ] || error \
+        "Missing lexicon data at $CONVERTED_DIR (clone/build libpinyin data, or set LIBPINYIN_DIR)"
 
     info "Build complete."
 }
@@ -72,14 +66,14 @@ do_build() {
 do_install() {
     local TARGET_DIR="$SCRIPT_DIR/target/$PROFILE"
     [ "$PROFILE" = "dev" ] && TARGET_DIR="$SCRIPT_DIR/target/debug"
-    local CONVERTED_DIR="$LIBCHINESE_DIR/data/converted"
+    local CONVERTED_DIR="$LIBPINYIN_DIR/data/converted"
+    local RAW_DATA="$LIBPINYIN_DIR/data"
 
     [ -f "$TARGET_DIR/pinyinwl" ] || error "pinyinwl not built. Run: ./install.sh build"
-    [ -d "$CONVERTED_DIR/simplified" ] || error "Data not built. Run: ./install.sh build"
+    [ -d "$CONVERTED_DIR/simplified" ] || error "Missing data at $CONVERTED_DIR. Set LIBPINYIN_DIR."
 
-    info "Installing binaries to $DESTDIR$BINDIR..."
+    info "Installing binary to $DESTDIR$BINDIR..."
     install -Dm755 "$TARGET_DIR/pinyinwl" "$DESTDIR$BINDIR/pinyinwl"
-    install -Dm755 "$TARGET_DIR/cosmic-applet-pinyin" "$DESTDIR$BINDIR/cosmic-applet-pinyin"
 
     info "Installing data to $DESTDIR$DATADIR..."
 
@@ -95,23 +89,26 @@ do_install() {
     install -Dm644 "$CONVERTED_DIR/traditional/word_bigram.dat" "$DESTDIR$DATADIR/traditional/word_bigram.dat"
     install -Dm644 "$CONVERTED_DIR/traditional/word_bigram_words.fst" "$DESTDIR$DATADIR/traditional/word_bigram_words.fst"
 
-    # Emoji table
-    if [ -f "$LIBCHINESE_DIR/data/emoji.table" ]; then
-        install -Dm644 "$LIBCHINESE_DIR/data/emoji.table" "$DESTDIR$DATADIR/simplified/emoji.table"
-        install -Dm644 "$LIBCHINESE_DIR/data/emoji.table" "$DESTDIR$DATADIR/traditional/emoji.table"
-    fi
+    # Emoji / English (prefer converted copies, else raw data/)
+    for name in emoji.table english.wordlist; do
+        local src=""
+        if [ -f "$CONVERTED_DIR/simplified/$name" ]; then
+            src="$CONVERTED_DIR/simplified/$name"
+        elif [ -f "$RAW_DATA/$name" ]; then
+            src="$RAW_DATA/$name"
+        fi
+        if [ -n "$src" ]; then
+            install -Dm644 "$src" "$DESTDIR$DATADIR/simplified/$name"
+            install -Dm644 "$src" "$DESTDIR$DATADIR/traditional/$name"
+        fi
+    done
 
-    # English mixed-input wordlist (混输)
-    if [ -f "$LIBCHINESE_DIR/data/english.wordlist" ]; then
-        install -Dm644 "$LIBCHINESE_DIR/data/english.wordlist" "$DESTDIR$DATADIR/simplified/english.wordlist"
-        install -Dm644 "$LIBCHINESE_DIR/data/english.wordlist" "$DESTDIR$DATADIR/traditional/english.wordlist"
-    fi
-
-    # Addon dictionaries (simplified copies + traditional s2twp when available)
+    # Addon dictionaries (simplified copies + traditional when available)
     if [ -d "$CONVERTED_DIR/addon" ]; then
         for addon_dir in "$CONVERTED_DIR/addon"/*/; do
             [ -d "$addon_dir" ] || continue
-            local addon_name="$(basename "$addon_dir")"
+            local addon_name
+            addon_name="$(basename "$addon_dir")"
             install -Dm644 "$addon_dir/lexicon.fst" "$DESTDIR$DATADIR/simplified/addon/$addon_name/lexicon.fst"
             install -Dm644 "$addon_dir/lexicon.dat" "$DESTDIR$DATADIR/simplified/addon/$addon_name/lexicon.dat"
             local trad_addon="$CONVERTED_DIR/traditional/addon/$addon_name"
@@ -125,20 +122,22 @@ do_install() {
         done
     fi
 
-    # Desktop file
-    info "Installing desktop file..."
-    install -Dm644 "$SCRIPT_DIR/data/com.system76.CosmicAppletPinyin.desktop" \
-        "$DESTDIR$APPDIR/com.system76.CosmicAppletPinyin.desktop"
+    info "Installing desktop file to $DESTDIR$APPDIR..."
+    install -Dm644 "$SCRIPT_DIR/data/com.pinyinwl.Settings.desktop" \
+        "$DESTDIR$APPDIR/com.pinyinwl.Settings.desktop"
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$DESTDIR$APPDIR" 2>/dev/null || true
+    fi
 
     echo ""
     info "Installation complete!"
     echo ""
-    echo "  Binaries:  $DESTDIR$BINDIR/pinyinwl"
-    echo "             $DESTDIR$BINDIR/cosmic-applet-pinyin"
+    echo "  Binary:    $DESTDIR$BINDIR/pinyinwl"
     echo "  Data:      $DESTDIR$DATADIR/"
-    echo "  Desktop:   $DESTDIR$APPDIR/com.system76.CosmicAppletPinyin.desktop"
+    echo "  Desktop:   $DESTDIR$APPDIR/com.pinyinwl.Settings.desktop"
     echo ""
     echo "  To configure: pinyinwl --settings"
+    echo "  Restart the IME (or log out/in) to pick up the new build."
 }
 
 # --- Main ---

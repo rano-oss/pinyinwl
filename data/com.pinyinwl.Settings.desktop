@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Pinyin Settings
+Comment=Pinyin input method preferences
+Exec=pinyinwl --settings
+Icon=preferences-desktop-keyboard
+Type=Application
+Categories=Settings;DesktopSettings;
+NoDisplay=true
+StartupWMClass=com.pinyinwl.Settings

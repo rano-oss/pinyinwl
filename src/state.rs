@@ -2,8 +2,13 @@
 
 use std::collections::HashSet;
 
-use libchinese_core::{ImeEngine, KeyEvent as ImeKeyEvent};
-use libpinyin::{parser::Parser, Engine};
+use libpinyin::lexicon::Lexicon;
+use libpinyin::path::{self, DataVariant};
+use libpinyin::word_bigram::WordBigram;
+use libpinyin::{
+    CandidateRankMode, CharacterForm, Editor, EditorOptions, Engine, InputPurpose,
+    KeyEvent as ImeKeyEvent, LanguageMode,
+};
 
 use cosmic::iced::platform_specific::shell::wayland::commands::input_method::{
     self, PopupPositionMode,
@@ -14,27 +19,29 @@ use crate::dbus;
 use crate::settings::{CharacterSet, PinyinConfig};
 use crate::Message;
 
-/// Default data directory for libpinyin model files
-const DATA_DIR: &str = "/usr/share/libpinyin/data";
-
-/// Handshake for StartOfPreedit popup lock (engine preedit is source of truth).
+/// StartOfPreedit probe: caret-at-0 commit, then real caret after IM `Done`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AnchorPhase {
-    /// Preedit empty — popup follows the text cursor.
     #[default]
     Idle,
     /// Caret-at-0 preedit sent; waiting for Done before real caret.
     Probing,
-    /// Commit sent; waiting for Done before caret-at-0 re-lock.
-    PartialCommitPending,
     Composing,
+    /// Partial commit flushed; next Done re-anchors like a fresh composition.
+    ReanchorPending,
+    /// Re-anchor probe in flight; leave caret at 0 so the latch takes the
+    /// start rect (syncing to the end immediately raced and locked the end).
+    ReanchorProbing,
 }
 
 pub struct InputMethodState {
-    pub engine: Engine,
-    pub ime: ImeEngine<Parser>,
+    pub editor: Editor,
     pub pinyin_config: PinyinConfig,
+    /// Pending 中/英 toggle on Shift release (cleared if another key is pressed).
     pub shift_set: bool,
+    /// Shift is down for this hold (key and/or modifiers). Prevents Modifiers from
+    /// re-arming `shift_set` after Shift+letter cancelled the toggle.
+    pub shift_held: bool,
     pub popup_id: window::Id,
     pub anchor_phase: AnchorPhase,
     /// Track raw_codes of key presses that were consumed (filtered).
@@ -44,68 +51,33 @@ pub struct InputMethodState {
 impl InputMethodState {
     pub fn new(pinyin_config: PinyinConfig) -> Self {
         let data_dir = resolve_data_dir(pinyin_config.character_set);
-        let engine = Engine::from_data_dir(&data_dir).unwrap_or_else(|e| {
+        let mut engine = Engine::from_data_dir(&data_dir).unwrap_or_else(|e| {
             log::error!("Failed to load pinyin data from {}: {}", data_dir, e);
-            log::error!("Set PINYINWL_DATA_DIR to point to a directory containing lexicon.fst + lexicon.dat + word_bigram.dat + word_bigram_words.fst");
+            log::error!("Set LIBPINYIN_DATA_DIR to a directory with lexicon.fst + lexicon.dat + word_bigram.dat + word_bigram_words.fst");
+            log::error!("If the error is 'Database already open', another pinyinwl holds ~/.pinyin/userdict.redb — set LIBPINYIN_USERDICT (or LIBPINYIN_DATA_DIR, which uses <data_dir>/userdict.redb)");
             std::process::exit(1);
         });
-        let mut ime = ImeEngine::from_arc_with_page_size(
-            engine.inner_arc(),
-            pinyin_config.candidates_per_page,
-        );
-        if pinyin_config.default_fullwidth {
-            ime.set_fullwidth(true);
-        }
-        if pinyin_config.select_keys != "123456789" {
-            ime.set_select_keys(&pinyin_config.select_keys);
-        }
-        // Profile first (sentences / rank / mixed-input defaults), then fine overrides.
-        engine.set_profile(pinyin_config.ime_profile);
-        engine.set_emoji_enabled(pinyin_config.emoji_candidate);
-        engine.set_english_enabled(pinyin_config.english_candidate);
-        engine.set_sort_by_pinyin_length(pinyin_config.sort_by_pinyin_length);
-        engine.set_double_pinyin_scheme(pinyin_config.double_pinyin_scheme.clone());
-        engine.set_allow_fuzzy(
-            pinyin_config.fuzzy_pinyin
-                || pinyin_config.pinyin_incomplete
-                || pinyin_config.correct_pinyin,
-        );
-        {
-            let mut cfg = engine.config_mut();
-            cfg.fuzzy = build_fuzzy_rules(&pinyin_config);
-            cfg.auto_suggestion = pinyin_config.auto_suggestion;
-            cfg.learning_enabled = pinyin_config.learning_enabled;
-            cfg.chinese_punctuation = pinyin_config.chinese_punctuation;
-            cfg.v_mode_enabled = pinyin_config.v_mode_enabled;
-            cfg.u_mode_enabled = pinyin_config.u_mode_enabled;
-            cfg.inline_prediction = pinyin_config.inline_prediction;
-            cfg.select_keys = pinyin_config.select_keys.clone();
-            cfg.incomplete_penalty = if pinyin_config.pinyin_incomplete {
-                500
-            } else {
-                i32::MAX / 4
-            };
-            cfg.show_raw_double_pinyin = pinyin_config.show_raw_double_pinyin;
-            cfg.choose_char_from_phrase = pinyin_config.choose_char_from_phrase;
-        }
         for addon_name in &pinyin_config.enabled_addons {
             engine.set_addon_enabled(addon_name, true);
         }
+        let mut editor = Editor::new(engine);
+        editor.set_editor_options(editor_options_from_config(&pinyin_config, false));
         Self {
-            engine,
-            ime,
+            editor,
             pinyin_config,
             shift_set: false,
+            shift_held: false,
             popup_id: window::Id::NONE,
             anchor_phase: AnchorPhase::Idle,
             consumed_keys: HashSet::new(),
         }
     }
 
+    /// Panel label: 英 / 全 / 繁 / 中 (passthrough → fullwidth → traditional → simplified).
     pub fn mode_status_text(&self) -> &str {
-        if self.ime.is_passthrough() {
+        if self.editor.language_mode() == LanguageMode::English {
             "英"
-        } else if self.ime.is_fullwidth() {
+        } else if self.editor.character_form() == CharacterForm::Fullwidth {
             "全"
         } else if self.pinyin_config.character_set == CharacterSet::Traditional {
             "繁"
@@ -115,9 +87,12 @@ impl InputMethodState {
     }
 
     pub fn publish_mode_status(&self) {
-        let english = self.ime.is_passthrough();
+        let english = self.editor.language_mode() == LanguageMode::English;
         ime_control::publish_mode_label(self.mode_status_text());
-        ime_control::publish_menu(dbus::menu_for_state(english, self.pinyin_config.character_set));
+        ime_control::publish_menu(dbus::menu_for_state(
+            english,
+            self.pinyin_config.character_set,
+        ));
     }
 
     pub fn reload_config(&mut self) {
@@ -137,7 +112,7 @@ impl InputMethodState {
 
     /// Switch 中/英 (ibus-libpinyin-style).
     pub fn set_english_mode(&mut self, english: bool) -> Task<Message> {
-        if english == self.ime.is_passthrough() {
+        if english == (self.editor.language_mode() == LanguageMode::English) {
             self.publish_mode_status();
             return Task::none();
         }
@@ -162,7 +137,11 @@ impl InputMethodState {
             None
         };
 
-        self.ime.set_passthrough(english);
+        self.editor.set_language_mode(if english {
+            LanguageMode::English
+        } else {
+            LanguageMode::Chinese
+        });
         self.publish_mode_status();
 
         commit.unwrap_or_else(Task::none)
@@ -184,20 +163,19 @@ impl InputMethodState {
         if charset_changed {
             let data_dir = resolve_data_dir(self.pinyin_config.character_set);
             let dir = std::path::Path::new(&data_dir);
-            match libchinese_core::Lexicon::load(&dir.join("lexicon.fst"), &dir.join("lexicon.dat"))
-            {
-                Ok(lex) => self.engine.swap_lexicon(lex),
+            match Lexicon::load(&dir.join("lexicon.fst"), &dir.join("lexicon.dat")) {
+                Ok(lex) => self.editor.engine.swap_lexicon(lex),
                 Err(e) => log::error!(
                     "Failed to load {:?} lexicon: {}",
                     self.pinyin_config.character_set,
                     e
                 ),
             }
-            match libchinese_core::WordBigram::load(
+            match WordBigram::load(
                 &dir.join("word_bigram.dat"),
                 &dir.join("word_bigram_words.fst"),
             ) {
-                Ok(wb) => self.engine.swap_word_bigram(wb),
+                Ok(wb) => self.editor.engine.swap_word_bigram(wb),
                 Err(e) => log::error!(
                     "Failed to load {:?} word_bigram: {}",
                     self.pinyin_config.character_set,
@@ -207,46 +185,19 @@ impl InputMethodState {
         }
 
         let c = &self.pinyin_config;
-        self.ime.set_page_size(c.candidates_per_page);
-        self.ime.set_select_keys(&c.select_keys);
-        self.ime.set_fullwidth(c.default_fullwidth);
-        {
-            let mut cfg = self.engine.config_mut();
-            cfg.select_keys = c.select_keys.clone();
-            cfg.auto_suggestion = c.auto_suggestion;
-            cfg.learning_enabled = c.learning_enabled;
-            cfg.chinese_punctuation = c.chinese_punctuation;
-            cfg.v_mode_enabled = c.v_mode_enabled;
-            cfg.u_mode_enabled = c.u_mode_enabled;
-            cfg.inline_prediction = c.inline_prediction;
-            cfg.show_raw_double_pinyin = c.show_raw_double_pinyin;
-            cfg.fuzzy = build_fuzzy_rules(c);
-            cfg.incomplete_penalty = if c.pinyin_incomplete {
-                500
-            } else {
-                i32::MAX / 4
-            };
-            cfg.choose_char_from_phrase = c.choose_char_from_phrase;
-        }
-        self.engine.set_profile(c.ime_profile);
-        self.engine.set_emoji_enabled(c.emoji_candidate);
-        self.engine.set_english_enabled(c.english_candidate);
-        self.engine
-            .set_sort_by_pinyin_length(c.sort_by_pinyin_length);
-        self.engine
-            .set_double_pinyin_scheme(c.double_pinyin_scheme.clone());
-        self.engine.set_allow_fuzzy(
-            c.fuzzy_pinyin || c.pinyin_incomplete || c.correct_pinyin,
-        );
+        let mut opts =
+            editor_options_from_config(c, self.editor.language_mode() == LanguageMode::English);
+        opts.input_purpose = self.editor.context.input_purpose;
+        self.editor.set_editor_options(opts);
 
         for addon in &old_addons {
             if !c.enabled_addons.contains(addon) {
-                self.engine.set_addon_enabled(addon, false);
+                self.editor.engine.set_addon_enabled(addon, false);
             }
         }
         for addon in &c.enabled_addons {
             if !old_addons.contains(addon) {
-                self.engine.set_addon_enabled(addon, true);
+                self.editor.engine.set_addon_enabled(addon, true);
             }
         }
     }
@@ -264,16 +215,41 @@ impl InputMethodState {
         self.publish_mode_status();
     }
 
+    pub fn set_input_purpose(&mut self, purpose: InputPurpose) {
+        self.editor.set_input_purpose(purpose);
+    }
+
+    pub fn set_content_type(&mut self, hint: u32, purpose: u32) {
+        const HINT_HIDDEN_TEXT: u32 = 0x40;
+        const HINT_SENSITIVE_DATA: u32 = 0x80;
+        let mapped = match purpose {
+            2 | 3 => InputPurpose::Number,
+            4 => InputPurpose::Phone,
+            5 => InputPurpose::Url,
+            6 => InputPurpose::Email,
+            8 | 9 => InputPurpose::Password,
+            13 => InputPurpose::Terminal,
+            _ => InputPurpose::FreeForm,
+        };
+        let mapped = if hint & (HINT_HIDDEN_TEXT | HINT_SENSITIVE_DATA) != 0 {
+            InputPurpose::Password
+        } else {
+            mapped
+        };
+        log::info!("content_type hint={hint:#x} raw_purpose={purpose} -> {mapped:?}");
+        self.set_input_purpose(mapped);
+    }
+
     pub fn preedit(&self) -> &str {
-        &self.ime.context().preedit_text
+        &self.editor.context.preedit_text
     }
 
     pub fn candidates(&self) -> &[String] {
-        &self.ime.context().candidates
+        &self.editor.context.candidates
     }
 
     pub fn candidate_cursor(&self) -> usize {
-        self.ime.context().candidate_cursor
+        self.editor.context.candidate_cursor
     }
 
     pub fn selection_keys(&self) -> &str {
@@ -281,11 +257,16 @@ impl InputMethodState {
     }
 
     fn cursor_byte_position(&self) -> i32 {
-        self.ime.context().preedit_cursor as i32
+        let preedit = self.preedit();
+        let mut c = self.editor.context.preedit_cursor.min(preedit.len());
+        while c > 0 && !preedit.is_char_boundary(c) {
+            c -= 1;
+        }
+        c as i32
     }
 
     fn take_commit(&mut self) -> Option<String> {
-        let ctx = self.ime.context_mut();
+        let ctx = &mut self.editor.context;
         if ctx.has_commit() {
             Some(ctx.take_commit())
         } else {
@@ -294,10 +275,18 @@ impl InputMethodState {
     }
 
     pub fn send_commit(&self, text: String) -> Task<Message> {
-        Task::batch([
-            input_method::commit_string(text),
-            input_method::commit(),
-        ])
+        input_method::commit_string(text).chain(input_method::commit())
+    }
+
+    /// One `done` with commit + remaining preedit at caret 0 (keeps commit on time).
+    /// Popup re-anchors on the following IM `Done` via [`AnchorPhase::ReanchorPending`].
+    /// Caret stays at 0 through [`AnchorPhase::ReanchorProbing`] so StartOfPreedit
+    /// latches the new start; the next key's `sync_preedit` moves the caret.
+    fn send_partial_commit(&mut self, text: String, preedit: String) -> Task<Message> {
+        self.anchor_phase = AnchorPhase::ReanchorPending;
+        input_method::commit_string(text)
+            .chain(input_method::set_preedit_string(preedit, 0, 0))
+            .chain(input_method::commit())
     }
 
     fn follow_cursor_sync(&mut self) -> Task<Message> {
@@ -310,38 +299,51 @@ impl InputMethodState {
         ])
     }
 
-    fn probe_preedit_at_zero(preedit: String) -> Task<Message> {
-        Task::batch([
-            input_method::set_preedit_string(preedit, 0, 0),
-            input_method::commit(),
-        ])
-    }
-
     fn start_preedit_anchor(&mut self, preedit: String) -> Task<Message> {
         self.anchor_phase = AnchorPhase::Probing;
-        Task::batch([
-            input_method::set_popup_position_mode(PopupPositionMode::StartOfPreedit),
-            Self::probe_preedit_at_zero(preedit),
-        ])
+        input_method::set_popup_position_mode(PopupPositionMode::StartOfPreedit)
+            .chain(input_method::set_preedit_string(preedit, 0, 0))
+            .chain(input_method::commit())
     }
 
-    fn send_preedit_sync(&self, preedit: String) -> Task<Message> {
-        let cursor = self.cursor_byte_position();
-        Task::batch([
-            input_method::set_preedit_string(preedit, cursor, cursor),
-            input_method::commit(),
-        ])
+    fn sync_preedit(&self) -> Task<Message> {
+        let preedit = self.preedit().to_owned();
+        if preedit.is_empty() {
+            Task::batch([
+                input_method::set_preedit_string(String::new(), 0, 0),
+                input_method::commit(),
+            ])
+        } else {
+            let cursor = self.cursor_byte_position();
+            Task::batch([
+                input_method::set_preedit_string(preedit, cursor, cursor),
+                input_method::commit(),
+            ])
+        }
     }
 
     pub fn handle_done(&mut self) -> Task<Message> {
         match self.anchor_phase {
             AnchorPhase::Probing => {
                 self.anchor_phase = AnchorPhase::Composing;
-                self.send_preedit_sync(self.preedit().to_owned())
+                self.sync_preedit()
             }
-            AnchorPhase::PartialCommitPending => {
-                self.anchor_phase = AnchorPhase::Probing;
-                Self::probe_preedit_at_zero(self.preedit().to_owned())
+            AnchorPhase::ReanchorPending => {
+                let preedit = self.preedit().to_owned();
+                if preedit.is_empty() {
+                    self.follow_cursor_sync()
+                } else {
+                    // Same probe as a fresh composition, but do not sync caret to
+                    // the end on the next Done — that raced the latch onto the end.
+                    self.anchor_phase = AnchorPhase::ReanchorProbing;
+                    input_method::set_popup_position_mode(PopupPositionMode::StartOfPreedit)
+                        .chain(input_method::set_preedit_string(preedit, 0, 0))
+                        .chain(input_method::commit())
+                }
+            }
+            AnchorPhase::ReanchorProbing => {
+                self.anchor_phase = AnchorPhase::Composing;
+                Task::none()
             }
             _ => Task::none(),
         }
@@ -349,15 +351,19 @@ impl InputMethodState {
 
     pub fn process_key_and_sync(&mut self) -> Task<Message> {
         if self.pinyin_config.auto_commit_single
+            && matches!(
+                self.anchor_phase,
+                AnchorPhase::Idle | AnchorPhase::Composing
+            )
             && self.candidates().len() == 1
             && !self.preedit().is_empty()
-            && !self.ime.context().has_commit()
+            && !self.editor.context.has_commit()
         {
-            let _ = self.ime.process_key(ImeKeyEvent::Number(1));
+            let _ = self.editor.process_key(ImeKeyEvent::Number(1));
         }
 
         if let Some(text) = self.take_commit() {
-            self.engine.commit(&text);
+            self.editor.engine.commit(&text);
             let preedit = self.preedit().to_owned();
             if preedit.is_empty() {
                 self.anchor_phase = AnchorPhase::Idle;
@@ -365,24 +371,34 @@ impl InputMethodState {
                     input_method::set_popup_position_mode(PopupPositionMode::FollowCursor),
                     input_method::reset_popup_size(),
                     self.send_commit(text),
+                    self.sync_preedit(),
                 ]);
             }
-            self.anchor_phase = AnchorPhase::PartialCommitPending;
-            return self.send_commit(text);
+            return self.send_partial_commit(text, preedit);
         }
 
         let preedit = self.preedit().to_owned();
         if preedit.is_empty() {
-            self.follow_cursor_sync()
+            // Only push FollowCursor + empty preedit when leaving a composing
+            // handshake. Re-sending empty commit on every idle Handled key
+            // (suggestion Enter/Backspace, etc.) floods Alacritty's IME path.
+            if self.anchor_phase != AnchorPhase::Idle {
+                self.follow_cursor_sync()
+            } else {
+                Task::batch([
+                    input_method::set_popup_position_mode(PopupPositionMode::FollowCursor),
+                    input_method::reset_popup_size(),
+                ])
+            }
         } else if self.anchor_phase == AnchorPhase::Idle {
             self.start_preedit_anchor(preedit)
         } else if matches!(
             self.anchor_phase,
-            AnchorPhase::Probing | AnchorPhase::PartialCommitPending
+            AnchorPhase::Probing | AnchorPhase::ReanchorPending | AnchorPhase::ReanchorProbing
         ) {
             Task::none()
         } else {
-            self.send_preedit_sync(preedit)
+            self.sync_preedit()
         }
     }
 
@@ -406,9 +422,12 @@ impl InputMethodState {
             // ←/→ always move the preedit cursor while composing.
             Key::Named(Named::ArrowLeft) => Some(ImeKeyEvent::Left),
             Key::Named(Named::ArrowRight) => Some(ImeKeyEvent::Right),
+            Key::Named(Named::Home) => Some(ImeKeyEvent::Home),
+            Key::Named(Named::End) => Some(ImeKeyEvent::End),
             Key::Named(Named::PageDown) => Some(ImeKeyEvent::PageDown),
             Key::Named(Named::PageUp) => Some(ImeKeyEvent::PageUp),
             Key::Named(Named::Backspace) => Some(ImeKeyEvent::Backspace),
+            Key::Named(Named::Delete) => Some(ImeKeyEvent::Delete),
             _ => None,
         };
         if nav_only {
@@ -418,9 +437,9 @@ impl InputMethodState {
             Key::Character(c)
                 if c.len() == 1 && c.as_bytes()[0] >= b'1' && c.as_bytes()[0] <= b'9' =>
             {
-                Some(ImeKeyEvent::Number((c.as_bytes()[0] - b'0') as u8))
+                Some(ImeKeyEvent::Number(c.as_bytes()[0] - b'0'))
             }
-            Key::Character(c) if c == " " => Some(ImeKeyEvent::Space),
+            Key::Character(" ") => Some(ImeKeyEvent::Space),
             Key::Named(Named::Enter) => Some(ImeKeyEvent::Enter),
             Key::Named(Named::Escape) => Some(ImeKeyEvent::Escape),
             Key::Named(Named::Tab) => Some(ImeKeyEvent::Tab),
@@ -430,28 +449,59 @@ impl InputMethodState {
 }
 
 pub fn resolve_data_dir(character_set: CharacterSet) -> String {
-    std::env::var("PINYINWL_DATA_DIR").unwrap_or_else(|_| {
-        let suffix = match character_set {
-            CharacterSet::Simplified => "simplified",
-            CharacterSet::Traditional => "traditional",
-        };
-        let candidates = [
-            format!("{}/{}", DATA_DIR, suffix),
-            DATA_DIR.to_string(),
-            format!(
-                "{}/.local/share/libpinyin/data/{}",
-                std::env::var("HOME").unwrap_or_default(),
-                suffix
-            ),
-            format!("../libchinese/data/converted/{}", suffix),
-        ];
-        for path in &candidates {
-            if std::path::Path::new(path).join("lexicon.fst").exists() {
-                return path.clone();
-            }
-        }
-        DATA_DIR.to_string()
-    })
+    let variant = match character_set {
+        CharacterSet::Simplified => DataVariant::Simplified,
+        CharacterSet::Traditional => DataVariant::Traditional,
+    };
+    path::resolve_data_dir(variant)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Map settings to a full [`EditorOptions`] blob (Best UX ranking).
+pub fn editor_options_from_config(c: &PinyinConfig, english: bool) -> EditorOptions {
+    let mut opts = EditorOptions {
+        candidates_per_page: c.candidates_per_page,
+        language_mode: if english {
+            LanguageMode::English
+        } else {
+            LanguageMode::Chinese
+        },
+        emoji_enabled: c.emoji_candidate,
+        english_enabled: c.english_candidate,
+        ..EditorOptions::default()
+    };
+    opts.select_keys = if c.select_keys.is_empty() {
+        "123456789".to_string()
+    } else {
+        c.select_keys.clone()
+    };
+    opts.character_form = if c.default_fullwidth {
+        CharacterForm::Fullwidth
+    } else {
+        CharacterForm::Halfwidth
+    };
+    opts.chinese_punctuation = c.chinese_punctuation;
+    opts.auto_suggestion = c.auto_suggestion;
+    opts.min_suggestion_trigger_length = if c.auto_suggestion { 1 } else { 2 };
+    opts.learning_enabled = c.learning_enabled;
+    opts.v_mode_enabled = c.v_mode_enabled;
+    opts.u_mode_enabled = c.u_mode_enabled;
+    opts.inline_prediction = c.inline_prediction;
+    opts.show_raw_double_pinyin = c.show_raw_double_pinyin;
+    opts.choose_char_from_phrase = c.choose_char_from_phrase;
+    opts.allow_fuzzy = c.fuzzy_pinyin || c.pinyin_incomplete || c.correct_pinyin;
+    opts.sort_by_pinyin_length = c.sort_by_pinyin_length;
+    opts.double_pinyin_scheme = c.double_pinyin_scheme.clone();
+    opts.emit_composed_sentences = true;
+    opts.candidate_rank_mode = CandidateRankMode::MatchedSpanThenScore;
+    opts.fuzzy = build_fuzzy_rules(c);
+    opts.incomplete_penalty = if c.pinyin_incomplete {
+        500
+    } else {
+        i32::MAX / 4
+    };
+    opts
 }
 
 pub fn build_fuzzy_rules(config: &PinyinConfig) -> Vec<String> {
