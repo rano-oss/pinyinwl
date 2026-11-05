@@ -71,14 +71,10 @@ impl InputMethodState {
         }
     }
 
-    /// Panel label: 英 / 全 / 繁 / 中 (passthrough → fullwidth → traditional → simplified).
+    /// Panel label: 中 / 英 only (width + 简/繁 stay in the menu / hotkeys).
     pub fn mode_status_text(&self) -> &str {
         if self.editor.language_mode() == LanguageMode::English {
             "英"
-        } else if self.editor.character_form() == CharacterForm::Fullwidth {
-            "全"
-        } else if self.pinyin_config.character_set == CharacterSet::Traditional {
-            "繁"
         } else {
             "中"
         }
