@@ -136,6 +136,7 @@ struct CandidateColors {
     dim_fg: Color,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn candidate_item<'a>(
     text_str: &str,
     index: usize,

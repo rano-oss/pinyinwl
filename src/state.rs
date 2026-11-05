@@ -137,7 +137,11 @@ impl InputMethodState {
             None
         };
 
-        self.editor.set_language_mode(if english { LanguageMode::English } else { LanguageMode::Chinese });
+        self.editor.set_language_mode(if english {
+            LanguageMode::English
+        } else {
+            LanguageMode::Chinese
+        });
         self.publish_mode_status();
 
         commit.unwrap_or_else(Task::none)
@@ -181,7 +185,8 @@ impl InputMethodState {
         }
 
         let c = &self.pinyin_config;
-        let mut opts = editor_options_from_config(c, self.editor.language_mode() == LanguageMode::English);
+        let mut opts =
+            editor_options_from_config(c, self.editor.language_mode() == LanguageMode::English);
         opts.input_purpose = self.editor.context.input_purpose;
         self.editor.set_editor_options(opts);
 
@@ -432,9 +437,9 @@ impl InputMethodState {
             Key::Character(c)
                 if c.len() == 1 && c.as_bytes()[0] >= b'1' && c.as_bytes()[0] <= b'9' =>
             {
-                Some(ImeKeyEvent::Number((c.as_bytes()[0] - b'0') as u8))
+                Some(ImeKeyEvent::Number(c.as_bytes()[0] - b'0'))
             }
-            Key::Character(c) if c == " " => Some(ImeKeyEvent::Space),
+            Key::Character(" ") => Some(ImeKeyEvent::Space),
             Key::Named(Named::Enter) => Some(ImeKeyEvent::Enter),
             Key::Named(Named::Escape) => Some(ImeKeyEvent::Escape),
             Key::Named(Named::Tab) => Some(ImeKeyEvent::Tab),

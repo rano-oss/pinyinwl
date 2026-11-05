@@ -71,16 +71,11 @@ const AVAILABLE_ADDONS: &[&str] = &[
 ];
 
 /// Character set for candidate generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum CharacterSet {
+    #[default]
     Simplified,
     Traditional,
-}
-
-impl Default for CharacterSet {
-    fn default() -> Self {
-        Self::Simplified
-    }
 }
 
 /// Pinyin settings stored in cosmic-config
@@ -757,7 +752,8 @@ fn build_settings_view(
             toggler(config.fuzzy_pinyin).on_toggle(Msg::ToggleFuzzyPinyin),
         ));
 
-    let fuzzy_rules: &[(&str, bool, fn(bool) -> Msg)] = &[
+    type ToggleRule = (&'static str, bool, fn(bool) -> Msg);
+    let fuzzy_rules: &[ToggleRule] = &[
         ("zh <=> z", config.fuzzy_zh_z, Msg::ToggleFuzzyZhZ),
         ("ch <=> c", config.fuzzy_ch_c, Msg::ToggleFuzzyChC),
         ("sh <=> s", config.fuzzy_sh_s, Msg::ToggleFuzzyShS),
@@ -796,7 +792,7 @@ fn build_settings_view(
         toggler(config.correct_pinyin).on_toggle(Msg::ToggleCorrectPinyin),
     ));
 
-    let correction_rules: &[(&str, bool, fn(bool) -> Msg)] = &[
+    let correction_rules: &[ToggleRule] = &[
         ("gn => ng", config.correct_gn_ng, Msg::ToggleCorrectGnNg),
         ("mg => ng", config.correct_mg_ng, Msg::ToggleCorrectMgNg),
         ("iou => iu", config.correct_iou_iu, Msg::ToggleCorrectIouIu),

@@ -563,16 +563,11 @@ fn handle_key_press(
                         .as_ref()
                         .and_then(|s| s.chars().last())
                         .and_then(|ch| {
-                            if ch.is_ascii_lowercase() {
-                                Some(ImeKeyEvent::Char(ch))
-                            } else if state.pinyin_config.chinese_punctuation
+                            let as_pinyin = ch.is_ascii_lowercase();
+                            let as_cn_punct = state.pinyin_config.chinese_punctuation
                                 && preferred_chinese_punct(ch).is_some()
-                                && page_alias(&key, &state.pinyin_config).is_none()
-                            {
-                                Some(ImeKeyEvent::Char(ch))
-                            } else {
-                                None
-                            }
+                                && page_alias(&key, &state.pinyin_config).is_none();
+                            (as_pinyin || as_cn_punct).then_some(ImeKeyEvent::Char(ch))
                         })
                 })
         };
@@ -636,13 +631,9 @@ fn handle_key_press(
     }
 
     if let Some(ch) = key_event.utf8.as_ref().and_then(|s| s.chars().last()) {
-        let as_ime = if ch.is_ascii_lowercase() {
-            Some(ImeKeyEvent::Char(ch))
-        } else if state.pinyin_config.chinese_punctuation && preferred_chinese_punct(ch).is_some() {
-            Some(ImeKeyEvent::Char(ch))
-        } else {
-            None
-        };
+        let as_ime = (ch.is_ascii_lowercase()
+            || (state.pinyin_config.chinese_punctuation && preferred_chinese_punct(ch).is_some()))
+        .then_some(ImeKeyEvent::Char(ch));
         if let Some(ime_key) = as_ime {
             if state.editor.process_key(ime_key) == KeyResult::Handled {
                 state.consumed_keys.insert(raw_code);
@@ -687,8 +678,8 @@ fn choose_char_alias(state: &InputMethodState, key: &Key) -> Option<ImeKeyEvent>
         return None;
     }
     match key.as_ref() {
-        Key::Character(c) if c == "[" => Some(ImeKeyEvent::ChooseCharFromPhrase(0)),
-        Key::Character(c) if c == "]" => Some(ImeKeyEvent::ChooseCharFromPhrase(-1)),
+        Key::Character("[") => Some(ImeKeyEvent::ChooseCharFromPhrase(0)),
+        Key::Character("]") => Some(ImeKeyEvent::ChooseCharFromPhrase(-1)),
         _ => None,
     }
 }
