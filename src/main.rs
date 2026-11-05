@@ -611,11 +611,15 @@ fn handle_key_press(
     }
 
     if let Some(ch) = key_event.utf8.as_ref().and_then(|s| s.chars().last()) {
-        // Fullwidth must run even in 英 mode — otherwise ASCII never converts.
+        // Fullwidth direct-commit for printable ASCII (英 mode, or non-letters in 中).
+        // Skip controls (Backspace/Delete often arrive as utf8 `\u{08}` / `\u{7f}`) —
+        // committing those yields gibberish and swallows the real key.
+        // Skip a-z in 中 mode so pinyin composition still starts.
+        let printable = ch.is_ascii_graphic() || ch == ' ';
+        let english = state.editor.language_mode() == LanguageMode::English;
         if state.editor.character_form() == CharacterForm::Fullwidth
-            && ch.is_ascii()
-            && ch != '\n'
-            && ch != '\r'
+            && printable
+            && (english || !ch.is_ascii_alphabetic())
         {
             state.consumed_keys.insert(raw_code);
             return wrap(Task::batch([

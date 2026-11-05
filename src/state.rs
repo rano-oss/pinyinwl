@@ -2,9 +2,7 @@
 
 use std::collections::HashSet;
 
-use libpinyin::lexicon::Lexicon;
 use libpinyin::path::{self, DataVariant};
-use libpinyin::word_bigram::WordBigram;
 use libpinyin::{
     CandidateRankMode, CharacterForm, Editor, EditorOptions, Engine, InputPurpose,
     KeyEvent as ImeKeyEvent, LanguageMode,
@@ -73,14 +71,10 @@ impl InputMethodState {
         }
     }
 
-    /// Panel label: 英 / 全 / 繁 / 中 (passthrough → fullwidth → traditional → simplified).
+    /// Panel label: 中 / 英 only (width + 简/繁 stay in the menu / hotkeys).
     pub fn mode_status_text(&self) -> &str {
         if self.editor.language_mode() == LanguageMode::English {
             "英"
-        } else if self.editor.character_form() == CharacterForm::Fullwidth {
-            "全"
-        } else if self.pinyin_config.character_set == CharacterSet::Traditional {
-            "繁"
         } else {
             "中"
         }
@@ -162,25 +156,13 @@ impl InputMethodState {
 
         if charset_changed {
             let data_dir = resolve_data_dir(self.pinyin_config.character_set);
-            let dir = std::path::Path::new(&data_dir);
-            match Lexicon::load(&dir.join("lexicon.fst"), &dir.join("lexicon.dat")) {
-                Ok(lex) => self.editor.engine.swap_lexicon(lex),
-                Err(e) => log::error!(
-                    "Failed to load {:?} lexicon: {}",
+            if let Err(e) = self.editor.engine.reload_phrase_data_from_dir(&data_dir) {
+                log::error!(
+                    "Failed to reload {:?} phrase data from {}: {}",
                     self.pinyin_config.character_set,
+                    data_dir,
                     e
-                ),
-            }
-            match WordBigram::load(
-                &dir.join("word_bigram.dat"),
-                &dir.join("word_bigram_words.fst"),
-            ) {
-                Ok(wb) => self.editor.engine.swap_word_bigram(wb),
-                Err(e) => log::error!(
-                    "Failed to load {:?} word_bigram: {}",
-                    self.pinyin_config.character_set,
-                    e
-                ),
+                );
             }
         }
 
