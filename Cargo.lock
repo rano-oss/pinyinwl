@@ -2813,6 +2813,8 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 [[package]]
 name = "libpinyin"
 version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e55d696bcc5d67a1b7a90673ea21e6830b06c14fbaea4afc07e9f2ec01d2fab9"
 dependencies = [
  "fst",
  "log",
