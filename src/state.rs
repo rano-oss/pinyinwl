@@ -2,9 +2,12 @@
 
 use std::collections::HashSet;
 
+use libpinyin::lexicon::Lexicon;
+use libpinyin::path::{self, DataVariant};
+use libpinyin::word_bigram::WordBigram;
 use libpinyin::{
-    CandidateRankMode, Editor, EditorOptions, Engine, InputPurpose, KeyEvent as ImeKeyEvent, Lexicon,
-    WordBigram,
+    CandidateRankMode, CharacterForm, Editor, EditorOptions, Engine, InputPurpose,
+    KeyEvent as ImeKeyEvent, LanguageMode,
 };
 
 use cosmic::iced::platform_specific::shell::wayland::commands::input_method::{
@@ -15,9 +18,6 @@ use cosmic::iced::{window, Task};
 use crate::dbus;
 use crate::settings::{CharacterSet, PinyinConfig};
 use crate::Message;
-
-/// Default data directory for libpinyin model files
-const DATA_DIR: &str = "/usr/share/libpinyin/data";
 
 /// StartOfPreedit probe: caret-at-0 commit, then real caret after IM `Done`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -53,8 +53,8 @@ impl InputMethodState {
         let data_dir = resolve_data_dir(pinyin_config.character_set);
         let mut engine = Engine::from_data_dir(&data_dir).unwrap_or_else(|e| {
             log::error!("Failed to load pinyin data from {}: {}", data_dir, e);
-            log::error!("Set PINYINWL_DATA_DIR to a directory with lexicon.fst + lexicon.dat + word_bigram.dat + word_bigram_words.fst");
-            log::error!("If the error is 'Database already open', another pinyinwl holds ~/.pinyin/userdict.redb — set LIBCHINESE_USERDICT (or PINYINWL_DATA_DIR, which now uses <data_dir>/userdict.redb)");
+            log::error!("Set LIBPINYIN_DATA_DIR to a directory with lexicon.fst + lexicon.dat + word_bigram.dat + word_bigram_words.fst");
+            log::error!("If the error is 'Database already open', another pinyinwl holds ~/.pinyin/userdict.redb — set LIBPINYIN_USERDICT (or LIBPINYIN_DATA_DIR, which uses <data_dir>/userdict.redb)");
             std::process::exit(1);
         });
         for addon_name in &pinyin_config.enabled_addons {
@@ -75,9 +75,9 @@ impl InputMethodState {
 
     /// Panel label: 英 / 全 / 繁 / 中 (passthrough → fullwidth → traditional → simplified).
     pub fn mode_status_text(&self) -> &str {
-        if self.editor.is_passthrough() {
+        if self.editor.language_mode() == LanguageMode::English {
             "英"
-        } else if self.editor.engine.model.config.full_width_enabled {
+        } else if self.editor.character_form() == CharacterForm::Fullwidth {
             "全"
         } else if self.pinyin_config.character_set == CharacterSet::Traditional {
             "繁"
@@ -87,7 +87,7 @@ impl InputMethodState {
     }
 
     pub fn publish_mode_status(&self) {
-        let english = self.editor.is_passthrough();
+        let english = self.editor.language_mode() == LanguageMode::English;
         ime_control::publish_mode_label(self.mode_status_text());
         ime_control::publish_menu(dbus::menu_for_state(
             english,
@@ -112,7 +112,7 @@ impl InputMethodState {
 
     /// Switch 中/英 (ibus-libpinyin-style).
     pub fn set_english_mode(&mut self, english: bool) -> Task<Message> {
-        if english == self.editor.is_passthrough() {
+        if english == (self.editor.language_mode() == LanguageMode::English) {
             self.publish_mode_status();
             return Task::none();
         }
@@ -137,7 +137,7 @@ impl InputMethodState {
             None
         };
 
-        self.editor.set_passthrough(english);
+        self.editor.set_language_mode(if english { LanguageMode::English } else { LanguageMode::Chinese });
         self.publish_mode_status();
 
         commit.unwrap_or_else(Task::none)
@@ -181,7 +181,7 @@ impl InputMethodState {
         }
 
         let c = &self.pinyin_config;
-        let mut opts = editor_options_from_config(c, self.editor.is_passthrough());
+        let mut opts = editor_options_from_config(c, self.editor.language_mode() == LanguageMode::English);
         opts.input_purpose = self.editor.context.input_purpose;
         self.editor.set_editor_options(opts);
 
@@ -444,65 +444,59 @@ impl InputMethodState {
 }
 
 pub fn resolve_data_dir(character_set: CharacterSet) -> String {
-    std::env::var("PINYINWL_DATA_DIR").unwrap_or_else(|_| {
-        let suffix = match character_set {
-            CharacterSet::Simplified => "simplified",
-            CharacterSet::Traditional => "traditional",
-        };
-        let candidates = [
-            format!("{}/{}", DATA_DIR, suffix),
-            DATA_DIR.to_string(),
-            format!(
-                "{}/.local/share/libpinyin/data/{}",
-                std::env::var("HOME").unwrap_or_default(),
-                suffix
-            ),
-            format!("../libpinyin/data/converted/{}", suffix),
-        ];
-        for path in &candidates {
-            if std::path::Path::new(path).join("lexicon.fst").exists() {
-                return path.clone();
-            }
-        }
-        DATA_DIR.to_string()
-    })
+    let variant = match character_set {
+        CharacterSet::Simplified => DataVariant::Simplified,
+        CharacterSet::Traditional => DataVariant::Traditional,
+    };
+    path::resolve_data_dir(variant)
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Map settings to a full [`EditorOptions`] blob (Best UX ranking).
-pub fn editor_options_from_config(c: &PinyinConfig, passthrough: bool) -> EditorOptions {
-    EditorOptions {
+pub fn editor_options_from_config(c: &PinyinConfig, english: bool) -> EditorOptions {
+    let mut opts = EditorOptions {
         candidates_per_page: c.candidates_per_page,
-        select_keys: if c.select_keys.is_empty() {
-            "123456789".to_string()
+        language_mode: if english {
+            LanguageMode::English
         } else {
-            c.select_keys.clone()
+            LanguageMode::Chinese
         },
-        full_width: c.default_fullwidth,
-        passthrough,
-        chinese_punctuation: c.chinese_punctuation,
-        auto_suggestion: c.auto_suggestion,
-        min_suggestion_trigger_length: if c.auto_suggestion { 1 } else { 2 },
-        learning_enabled: c.learning_enabled,
-        v_mode_enabled: c.v_mode_enabled,
-        u_mode_enabled: c.u_mode_enabled,
-        inline_prediction: c.inline_prediction,
-        show_raw_double_pinyin: c.show_raw_double_pinyin,
-        choose_char_from_phrase: c.choose_char_from_phrase,
         emoji_enabled: c.emoji_candidate,
         english_enabled: c.english_candidate,
-        allow_fuzzy: c.fuzzy_pinyin || c.pinyin_incomplete || c.correct_pinyin,
-        sort_by_pinyin_length: c.sort_by_pinyin_length,
-        double_pinyin_scheme: c.double_pinyin_scheme.clone(),
-        emit_composed_sentences: true,
-        candidate_rank_mode: CandidateRankMode::MatchedSpanThenScore,
-        fuzzy: build_fuzzy_rules(c),
-        incomplete_penalty: if c.pinyin_incomplete {
-            500
-        } else {
-            i32::MAX / 4
-        },
         ..EditorOptions::default()
-    }
+    };
+    opts.select_keys = if c.select_keys.is_empty() {
+        "123456789".to_string()
+    } else {
+        c.select_keys.clone()
+    };
+    opts.character_form = if c.default_fullwidth {
+        CharacterForm::Fullwidth
+    } else {
+        CharacterForm::Halfwidth
+    };
+    opts.chinese_punctuation = c.chinese_punctuation;
+    opts.auto_suggestion = c.auto_suggestion;
+    opts.min_suggestion_trigger_length = if c.auto_suggestion { 1 } else { 2 };
+    opts.learning_enabled = c.learning_enabled;
+    opts.v_mode_enabled = c.v_mode_enabled;
+    opts.u_mode_enabled = c.u_mode_enabled;
+    opts.inline_prediction = c.inline_prediction;
+    opts.show_raw_double_pinyin = c.show_raw_double_pinyin;
+    opts.choose_char_from_phrase = c.choose_char_from_phrase;
+    opts.allow_fuzzy = c.fuzzy_pinyin || c.pinyin_incomplete || c.correct_pinyin;
+    opts.sort_by_pinyin_length = c.sort_by_pinyin_length;
+    opts.double_pinyin_scheme = c.double_pinyin_scheme.clone();
+    opts.emit_composed_sentences = true;
+    opts.candidate_rank_mode = CandidateRankMode::MatchedSpanThenScore;
+    opts.fuzzy = build_fuzzy_rules(c);
+    opts.incomplete_penalty = if c.pinyin_incomplete {
+        500
+    } else {
+        i32::MAX / 4
+    };
+    opts
 }
 
 pub fn build_fuzzy_rules(config: &PinyinConfig) -> Vec<String> {

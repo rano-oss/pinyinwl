@@ -33,8 +33,8 @@ use cosmic::app::{Core, Task};
 use cosmic::iced::{self, Length};
 use cosmic::widget::{self, checkbox, container, row, settings, toggler};
 use cosmic::{executor, Element};
-use libpinyin::DoublePinyinScheme;
-use libpinyin::UserDict;
+use libpinyin::double_pinyin::DoublePinyinScheme;
+use libpinyin::userdict::UserDict;
 use serde::{Deserialize, Serialize};
 
 pub const CONFIG_NAME: &str = "com.pinyinwl.Settings";

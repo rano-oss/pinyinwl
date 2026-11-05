@@ -3,7 +3,8 @@ mod settings;
 mod state;
 mod view;
 
-use libpinyin::{preferred_chinese_punct, utils, KeyEvent as ImeKeyEvent, KeyResult};
+use libpinyin::editor::{preferred_chinese_punct, to_fullwidth};
+use libpinyin::{CharacterForm, KeyEvent as ImeKeyEvent, KeyResult, LanguageMode};
 
 use cosmic::app::Core;
 use cosmic::iced::core::event::wayland::input_method::{
@@ -143,7 +144,7 @@ impl cosmic::Application for PinyinWl {
             Message::Activate => {
                 log::info!(
                     "activate passthrough={} phase={:?} preedit={:?} mode={}",
-                    state.editor.is_passthrough(),
+                    state.editor.language_mode() == LanguageMode::English,
                     state.anchor_phase,
                     state.preedit(),
                     state.mode_status_text()
@@ -165,7 +166,7 @@ impl cosmic::Application for PinyinWl {
             Message::Deactivate => {
                 log::info!(
                     "deactivate passthrough={} phase={:?} preedit={:?}",
-                    state.editor.is_passthrough(),
+                    state.editor.language_mode() == LanguageMode::English,
                     state.anchor_phase,
                     state.preedit()
                 );
@@ -185,7 +186,7 @@ impl cosmic::Application for PinyinWl {
                     key_event.keysym,
                     key_event.utf8,
                     state.shift_set,
-                    state.editor.is_passthrough(),
+                    state.editor.language_mode() == LanguageMode::English,
                     state.anchor_phase,
                     state.preedit()
                 );
@@ -200,7 +201,7 @@ impl cosmic::Application for PinyinWl {
                     state.shift_held = false;
                     if state.shift_set {
                         state.shift_set = false;
-                        let english = !state.editor.is_passthrough();
+                        let english = state.editor.language_mode() != LanguageMode::English;
                         log::info!(
                             "shift-toggle serial={serial} raw={raw_code} -> english={english} mode={}",
                             if english { "英" } else { "中" }
@@ -240,7 +241,7 @@ impl cosmic::Application for PinyinWl {
                     state.shift_held = false;
                     if state.shift_set {
                         state.shift_set = false;
-                        let english = !state.editor.is_passthrough();
+                        let english = state.editor.language_mode() != LanguageMode::English;
                         log::info!(
                             "shift-toggle via modifiers -> english={english} mode={}",
                             if english { "英" } else { "中" }
@@ -262,7 +263,7 @@ impl cosmic::Application for PinyinWl {
                 }
             }
             Message::DbusToggleMode => {
-                let english = !state.editor.is_passthrough();
+                let english = state.editor.language_mode() != LanguageMode::English;
                 wrap(state.set_english_mode(english))
             }
             Message::DbusSetPassthrough(passthrough) => wrap(state.set_english_mode(passthrough)),
@@ -273,7 +274,13 @@ impl cosmic::Application for PinyinWl {
                 } else {
                     Task::none()
                 };
-                state.editor.engine.model.config.full_width_enabled ^= true;
+                {
+                    let next = match state.editor.character_form() {
+                        CharacterForm::Halfwidth => CharacterForm::Fullwidth,
+                        CharacterForm::Fullwidth => CharacterForm::Halfwidth,
+                    };
+                    state.editor.set_character_form(next);
+                }
                 state.publish_mode_status();
                 cmd
             }
@@ -598,25 +605,32 @@ fn handle_key_press(
 
     // Shift+Space toggles fullwidth (ibus-libpinyin style), including in 英 mode.
     if matches!(key.as_ref(), Key::Character(c) if c == " ") && modifiers.shift {
-        state.editor.engine.model.config.full_width_enabled ^= true;
+        let next = match state.editor.character_form() {
+            CharacterForm::Halfwidth => CharacterForm::Fullwidth,
+            CharacterForm::Fullwidth => CharacterForm::Halfwidth,
+        };
+        state.editor.set_character_form(next);
         state.publish_mode_status();
         state.consumed_keys.insert(raw_code);
         return wrap(input_method::filter_key(serial, true));
     }
 
     if let Some(ch) = key_event.utf8.as_ref().and_then(|s| s.chars().last()) {
-        // Fullwidth must run even in 英 passthrough — otherwise ASCII never converts.
-        let fullwidth = state.editor.engine.model.config.full_width_enabled;
-        if fullwidth && ch.is_ascii() && ch != '\n' && ch != '\r' {
+        // Fullwidth must run even in 英 mode — otherwise ASCII never converts.
+        if state.editor.character_form() == CharacterForm::Fullwidth
+            && ch.is_ascii()
+            && ch != '\n'
+            && ch != '\r'
+        {
             state.consumed_keys.insert(raw_code);
             return wrap(Task::batch([
-                state.send_commit(utils::to_fullwidth(&ch.to_string())),
+                state.send_commit(to_fullwidth(&ch.to_string())),
                 input_method::filter_key(serial, true),
             ]));
         }
     }
 
-    if state.editor.is_passthrough() {
+    if state.editor.language_mode() == LanguageMode::English {
         state.consumed_keys.remove(&raw_code);
         return wrap(input_method::filter_key(serial, false));
     }
