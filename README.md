@@ -6,7 +6,9 @@ Includes `pinyinwl` (IME daemon). Panel mode/menu comes from cosmic-applet-input
 
 ## Build
 
-Depends on crates.io [`libpinyin`](https://crates.io/crates/libpinyin) plus COSMIC/Wayland deps. Lexicon install data comes from a sibling `../libpinyin` checkout (`data/converted/`).
+Depends on crates.io [`libpinyin`](https://crates.io/crates/libpinyin) `0.3` plus COSMIC/Wayland deps. Shared panel D-Bus is the separate [`ime-control`](https://github.com/rano-oss/ime-control) crate (not vendored here).
+
+Lexicon data is resolved by libpinyin (`LIBPINYIN_DATA_DIR`, `/usr/share/libpinyin/data`, or a sibling `../libpinyin/data/converted/` checkout).
 
 ```bash
 cargo build --release
