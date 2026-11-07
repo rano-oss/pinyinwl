@@ -222,17 +222,17 @@ impl cosmic::Application for PinyinWl {
             Message::Modifiers(modifiers) => {
                 log::info!(
                     "modifiers shift={} ctrl={} alt={} logo={} shift_set={} shift_held={}",
-                    modifiers.shift,
-                    modifiers.ctrl,
-                    modifiers.alt,
-                    modifiers.logo,
+                    modifiers.shift(),
+                    modifiers.control(),
+                    modifiers.alt(),
+                    modifiers.logo(),
                     state.shift_set,
                     state.shift_held
                 );
                 // Fallback when Shift Key press/release never reaches the IME.
                 // Rising edge only — never re-arm after Shift+letter cleared shift_set
                 // (capitals in 英 mode), including late modifiers after the letter.
-                if modifiers.shift {
+                if modifiers.shift() {
                     if !state.shift_held {
                         state.shift_held = true;
                         state.shift_set = true;
@@ -456,9 +456,9 @@ fn handle_key_press(
     }
 
     // Ctrl+Shift+F: toggle 简/繁 when idle.
-    if modifiers.ctrl
-        && modifiers.shift
-        && !modifiers.alt
+    if modifiers.control()
+        && modifiers.shift()
+        && !modifiers.alt()
         && matches!(key.as_ref(), Key::Character(c) if c.eq_ignore_ascii_case("f"))
         && state.preedit().is_empty()
         && state.candidates().is_empty()
@@ -470,9 +470,9 @@ fn handle_key_press(
     }
 
     // Ctrl+.: toggle punctuation mode (ibus/fcitx).
-    if modifiers.ctrl
-        && !modifiers.shift
-        && !modifiers.alt
+    if modifiers.control()
+        && !modifiers.shift()
+        && !modifiers.alt()
         && matches!(key.as_ref(), Key::Character(c) if c == ".")
     {
         state.shift_set = false;
@@ -487,9 +487,9 @@ fn handle_key_press(
     }
 
     // Ctrl+7: forget highlighted candidate (fcitx default).
-    if modifiers.ctrl
-        && !modifiers.shift
-        && !modifiers.alt
+    if modifiers.control()
+        && !modifiers.shift()
+        && !modifiers.alt()
         && !state.candidates().is_empty()
         && matches!(key.as_ref(), Key::Character(c) if c == "7")
     {
@@ -505,9 +505,9 @@ fn handle_key_press(
     }
 
     // Ctrl+8: pin highlighted candidate as custom phrase.
-    if modifiers.ctrl
-        && !modifiers.shift
-        && !modifiers.alt
+    if modifiers.control()
+        && !modifiers.shift()
+        && !modifiers.alt()
         && !state.candidates().is_empty()
         && matches!(key.as_ref(), Key::Character(c) if c == "8")
     {
@@ -599,7 +599,7 @@ fn handle_key_press(
     state.shift_set = false;
 
     // Shift+Space toggles fullwidth (ibus-libpinyin style), including in 英 mode.
-    if matches!(key.as_ref(), Key::Character(c) if c == " ") && modifiers.shift {
+    if matches!(key.as_ref(), Key::Character(c) if c == " ") && modifiers.shift() {
         let next = match state.editor.character_form() {
             CharacterForm::Halfwidth => CharacterForm::Fullwidth,
             CharacterForm::Fullwidth => CharacterForm::Halfwidth,
@@ -711,7 +711,7 @@ fn selection_number(
         }
     }
 
-    if state.pinyin_config.shift_select_candidate && modifiers.shift && !modifiers.ctrl {
+    if state.pinyin_config.shift_select_candidate && modifiers.shift() && !modifiers.control() {
         let idx = match key_event.keysym {
             k @ 0x0031..=0x0039 => Some((k - 0x0031) as usize),
             0x0030 => Some(9),
